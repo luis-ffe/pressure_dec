@@ -1,5 +1,5 @@
 import csv
-import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +37,29 @@ class SampleTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_serial_defaults_to_dma_baudrate(self):
+        self.assertEqual(SerialTransport("loop://").baudrate, 460_800)
+
+    def test_serial_decodes_fixed_binary_dma_capture(self):
+        transport = SerialTransport("loop://")
+        fake_serial = MagicMock()
+        pairs = [(index & 0x0FFF, (index + 100) & 0x0FFF) for index in range(5_000)]
+        payload = b"".join(struct.pack("<HH", *pair) for pair in pairs)
+        fake_serial.in_waiting = len(payload)
+        fake_serial.read.return_value = payload
+        transport._serial = fake_serial
+
+        first = transport.read_sample()
+        second = transport.read_sample()
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual((first.fsr1_raw, first.fsr2_raw), pairs[0])
+        self.assertEqual(first.sequence, 0)
+        self.assertEqual(second.device_time_us - first.device_time_us, 100)
+        self.assertEqual(len(transport._decoded_samples), 4_998)
+
     def test_serial_move_command(self):
         transport = SerialTransport("loop://")
         fake_serial = MagicMock()

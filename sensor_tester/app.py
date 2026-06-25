@@ -42,6 +42,7 @@ class SensorTesterApp(tk.Tk):
         self.recording_device_started_us: int | None = None
         self.current_recording_start_index = 0
         self.last_graph_sample_us: int | None = None
+        self.recording_start_device_us = 0
         self.last_graph_host_time = 0.0
         self.connected_transport = ""
         self.current_direction = ""
@@ -58,8 +59,8 @@ class SensorTesterApp(tk.Tk):
         self.wifi_var = tk.StringVar(value="http://192.168.4.1")
         self.connection_var = tk.StringVar(value="Disconnected")
         self.test_var = tk.StringVar(value="Compression")
-        self.steps_var = tk.IntVar(value=200)
-        self.delay_var = tk.IntVar(value=500)
+        self.steps_var = tk.IntVar(value=3200)
+        self.delay_var = tk.IntVar(value=62)
         self.fsr1_var = tk.StringVar(value="—")
         self.fsr2_var = tk.StringVar(value="—")
         self.motion_var = tk.StringVar(value="Idle")
@@ -113,6 +114,7 @@ class SensorTesterApp(tk.Tk):
         direction_line.pack(fill="x", pady=(10, 4))
         ttk.Button(direction_line, text="▲ Move up", command=lambda: self._move("up")).pack(side="left", fill="x", expand=True, padx=(0, 4))
         ttk.Button(direction_line, text="▼ Move down", command=lambda: self._move("down")).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(test, text="Automated Test", command=self._auto_test).pack(fill="x", pady=(6, 0))
         ttk.Button(test, text="STOP MOTOR", style="Emergency.TButton", command=self._stop_motor).pack(fill="x", pady=(6, 0), ipady=7)
         ttk.Label(test, textvariable=self.motion_var).pack(anchor="center", pady=(6, 0))
 
@@ -224,29 +226,71 @@ class SensorTesterApp(tk.Tk):
             self.worker.send_stop()
         self.motion_var.set("Stopped")
 
+    def _auto_test(self) -> None:
+        if not self.worker.running:
+            messagebox.showwarning("Not connected", "Connect to the ESP32 first.")
+            return
+        
+        threshold = 4000
+        down_speed = 62
+        up_speed = 62
+        max_steps = 16000
+        
+        self.worker.send_autotest(threshold, down_speed, up_speed, max_steps)
+        self.motion_var.set(f"Automated Test: moving down (max {max_steps} steps) until {threshold}")
+
     def _toggle_recording(self) -> None:
         if not self.recording:
             if not self.worker.running:
                 messagebox.showwarning("Not connected", "Connect to the ESP32 before recording.")
                 return
-            self.recording = True
-            self.recording_started = time.monotonic()
-            self.recording_device_started_us = None
-            self.current_recording_start_index = len(self.measurements)
-            self.response_delay_var.set("Response delay: recording…")
-            self.worker.set_recording(True)
-            self.record_button.configure(text="Stop recording")
-            self.record_var.set(f"Recording… {len(self.measurements)} samples")
+            if self.connected_transport != "USB":
+                messagebox.showwarning(
+                    "USB required",
+                    "The 10 kHz DMA capture is available only through USB.",
+                )
+                return
+            self._begin_recording(send_trigger=True)
         else:
-            self.recording = False
             self.worker.set_recording(False)
-            self.record_button.configure(text="Start recording")
-            self.record_var.set(f"Stopped — {len(self.measurements)} samples")
-            latest_recording = self.measurements[self.current_recording_start_index :]
-            delay = calculate_response_delay(latest_recording)
-            self.response_delay_var.set(
-                delay.summary if delay else "Response delay: no clear force change detected"
-            )
+            self.record_button.configure(text="Stopping...", state="disabled")
+            self.record_var.set("Stopping capture...")
+
+    def _begin_recording(self, send_trigger: bool) -> None:
+        self.recording = True
+        self.recording_started = time.monotonic()
+        self.recording_device_started_us = None
+        self.current_recording_start_index = len(self.measurements)
+        self.response_delay_var.set("Response delay: capturing…")
+        if send_trigger:
+            self.worker.set_recording(True)
+        self.record_button.configure(text="Stop recording", state="normal")
+        self.record_var.set("Waiting for 10 kHz DMA capture…")
+        
+        if hasattr(self, "_auto_stop_timer") and self._auto_stop_timer:
+            self.after_cancel(self._auto_stop_timer)
+        self._auto_stop_timer = self.after(120_000, self._auto_stop_recording)
+
+    def _auto_stop_recording(self) -> None:
+        if self.recording:
+            self.worker.set_recording(False)
+            self.record_button.configure(text="Stopping...", state="disabled")
+            self.record_var.set("Auto-stopping capture (2 min limit)...")
+
+    def _finish_recording(self) -> None:
+        if not self.recording:
+            return
+        if hasattr(self, "_auto_stop_timer") and self._auto_stop_timer:
+            self.after_cancel(self._auto_stop_timer)
+            self._auto_stop_timer = None
+        self.recording = False
+        self.record_button.configure(text="Start recording", state="normal")
+        latest_recording = self.measurements[self.current_recording_start_index :]
+        self.record_var.set(f"Capture complete — {len(latest_recording)} samples")
+        delay = calculate_response_delay(latest_recording)
+        self.response_delay_var.set(
+            delay.summary if delay else "Response delay: no clear force change detected"
+        )
 
     def _clear_data(self) -> None:
         if self.recording:
@@ -301,6 +345,13 @@ class SensorTesterApp(tk.Tk):
                 self.motion_var.set(str(data))
             elif event == "recording_state":
                 pass
+            elif event == "capture_started":
+                if not self.recording:
+                    self._begin_recording(send_trigger=False)
+                self.record_button.configure(text="Stop recording", state="normal")
+                self.record_var.set("Receiving continuous high-rate capture…")
+            elif event == "capture_complete":
+                self._finish_recording()
             elif event == "sample":
                 redraw = self._accept_sample(data) or redraw  # type: ignore[arg-type]
         if redraw:
@@ -309,7 +360,17 @@ class SensorTesterApp(tk.Tk):
 
     def _accept_sample(self, sample: Sample) -> bool:
         now = time.monotonic()
-        sample_clock = sample.device_time_us / 1_000_000 if sample.device_time_us else now
+        
+        if sample.sequence == 0:
+            self.recording_start_device_us = self.last_graph_sample_us or 0
+            
+        if sample.sequence > 0:
+            adjusted_device_us = self.recording_start_device_us + sample.device_time_us
+        else:
+            adjusted_device_us = sample.device_time_us
+
+        sample_clock = adjusted_device_us / 1_000_000 if adjusted_device_us else now
+
         if self.recording:
             if sample.device_time_us:
                 if self.recording_device_started_us is None:
@@ -319,7 +380,7 @@ class SensorTesterApp(tk.Tk):
                 elapsed = now - self.recording_started
             self.measurements.append(
                 Measurement(
-                    time_ms=round(elapsed * 1000),
+                    time_ms=round(elapsed * 1000, 3),
                     fsr1=sample.fsr1_raw,
                     fsr2=sample.fsr2_raw,
                 )
@@ -327,14 +388,14 @@ class SensorTesterApp(tk.Tk):
         if sample.device_time_us:
             plot_due = (
                 self.last_graph_sample_us is None
-                or sample.device_time_us - self.last_graph_sample_us >= 200_000
+                or adjusted_device_us - self.last_graph_sample_us >= 200_000
             )
         else:
             plot_due = now - self.last_graph_host_time >= 0.2
         if not plot_due:
             return False
 
-        self.last_graph_sample_us = sample.device_time_us or self.last_graph_sample_us
+        self.last_graph_sample_us = adjusted_device_us or self.last_graph_sample_us
         self.last_graph_host_time = now
         self.fsr1_var.set(str(sample.fsr1_raw))
         self.fsr2_var.set(str(sample.fsr2_raw))

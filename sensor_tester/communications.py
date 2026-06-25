@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import json
 import queue
+import struct
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -95,7 +96,11 @@ class Transport(ABC):
     def read_sample(self) -> Sample | None: ...
 
     @abstractmethod
-    def move(self, direction: str, steps: int, delay_us: int) -> None: ...
+    def move(self, direction: str, steps: int, delay_us: int) -> None:
+        raise NotImplementedError
+
+    def autotest(self, threshold: int, down_speed: int, up_speed: int, retract_steps: int) -> None:
+        raise NotImplementedError
 
     @abstractmethod
     def stop(self) -> None: ...
@@ -106,21 +111,37 @@ class Transport(ABC):
 
 class SerialTransport(Transport):
     name = "USB"
+    SAMPLE_INTERVAL_US = 100
+    CAPTURE_SAMPLE_PAIRS = 5_000
+    CAPTURE_BYTES = CAPTURE_SAMPLE_PAIRS * 2 * 2
 
-    def __init__(self, port: str, baudrate: int = 115200) -> None:
+    def __init__(self, port: str, baudrate: int = 460_800) -> None:
         self.port = port
         self.baudrate = baudrate
         self._serial: Any = None
+        self._rx_buffer = bytearray()
+        self._decoded_samples: deque[Sample] = deque()
+        self._in_binary_capture = False
+        self._capture_complete_ready = False
+        self._binary_sequence = 0
+
+    @property
+    def in_binary_capture(self) -> bool:
+        return self._in_binary_capture
 
     def connect(self) -> None:
         try:
             import serial
 
             self._serial = serial.serial_for_url(
-                self.port, self.baudrate, timeout=0.25, write_timeout=1
+                self.port, self.baudrate, timeout=0.01, write_timeout=1
             )
             time.sleep(1.5)  # Many ESP32 boards reset when the port opens.
             self._serial.reset_input_buffer()
+            self._rx_buffer.clear()
+            self._decoded_samples.clear()
+            self._in_binary_capture = False
+            self._capture_complete_ready = False
             self._write("PING")
         except Exception as exc:
             self.close()
@@ -146,30 +167,97 @@ class SerialTransport(Transport):
     def read_sample(self) -> Sample | None:
         if self._serial is None:
             raise CommunicationError("USB is not connected")
-        raw = self._serial.readline()
-        if not raw:
+
+        if self._decoded_samples:
+            return self._decoded_samples.popleft()
+
+        if self._capture_complete_ready:
+            self._capture_complete_ready = False
+            self._in_binary_capture = False
             return None
-        text = raw.decode("utf-8", errors="replace").strip()
-        if text.startswith("S,"):
-            try:
-                return Sample.from_compact_usb(text)
-            except ValueError:
-                return None
-        try:
-            payload = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if payload.get("type") != "sample" and not ({"f1", "f2"} <= payload.keys()):
-            return None
-        return Sample.from_payload(payload)
+
+        waiting = int(getattr(self._serial, "in_waiting", 0))
+        chunk = self._serial.read(max(1, waiting))
+        if chunk:
+            self._rx_buffer.extend(chunk)
+
+        while True:
+            if self._in_binary_capture or self._rx_buffer:
+                if not self._in_binary_capture:
+                    # The firmware sends no ASCII markers: any USB bytes from
+                    # the ESP32 are treated as the start of one fixed capture.
+                    self._in_binary_capture = True
+                    self._binary_sequence = 0
+                if len(self._rx_buffer) < self.CAPTURE_BYTES:
+                    return None
+
+                payload = bytes(self._rx_buffer[: self.CAPTURE_BYTES])
+                del self._rx_buffer[: self.CAPTURE_BYTES]
+
+                for sequence, (fsr1, fsr2) in enumerate(struct.iter_unpack("<HH", payload)):
+                    device_time_us = sequence * self.SAMPLE_INTERVAL_US
+                    self._decoded_samples.append(
+                        Sample(
+                            device_time_ms=device_time_us // 1000,
+                            device_time_us=device_time_us,
+                            fsr1_time_us=device_time_us,
+                            fsr2_time_us=device_time_us,
+                            fsr1_raw=fsr1,
+                            fsr2_raw=fsr2,
+                            sequence=sequence,
+                            motion_status_known=False,
+                        )
+                    )
+
+                self._capture_complete_ready = True
+                return self._decoded_samples.popleft()
+            else:
+                if b'\n' in self._rx_buffer:
+                    line_end = self._rx_buffer.index(b'\n')
+                    line_bytes = self._rx_buffer[:line_end]
+                    del self._rx_buffer[:line_end + 1]
+                    
+                    if line_bytes.endswith(b'\r'):
+                        line_bytes = line_bytes[:-1]
+                        
+                    try:
+                        line = line_bytes.decode("ascii").strip()
+                    except UnicodeDecodeError:
+                        continue
+
+                    if line == "BINARY_CAPTURE_START":
+                        self._in_binary_capture = True
+                        self._binary_sequence = 0
+                        continue
+                    elif line.startswith("S,"):
+                        try:
+                            sample = Sample.from_compact_usb(line)
+                            self._decoded_samples.append(sample)
+                            return self._decoded_samples.popleft()
+                        except ValueError:
+                            pass
+                else:
+                    return None
 
     def move(self, direction: str, steps: int, delay_us: int) -> None:
         self._write(f"MOVE,{direction.upper()},{steps},{delay_us}")
+
+    def autotest(self, threshold: int, down_speed: int, up_speed: int, retract_steps: int) -> None:
+        self._write(f"AUTOTEST,{threshold},{down_speed},{up_speed},{retract_steps}")
 
     def stop(self) -> None:
         self._write("STOP")
 
     def set_recording(self, active: bool) -> None:
+        if active:
+            self._rx_buffer.clear()
+            self._decoded_samples.clear()
+            self._in_binary_capture = True
+            self._capture_complete_ready = False
+            self._binary_sequence = 0
+        else:
+            self._capture_complete_ready = False
+            self._in_binary_capture = False
         self._write(f"RECORD,{1 if active else 0}")
 
 
@@ -211,6 +299,9 @@ class WifiTransport(Transport):
         firmware_direction = "forward" if direction.lower() == "up" else "backward"
         self._get("/move", dir=firmware_direction, steps=steps, speed=delay_us)
 
+    def autotest(self, threshold: int, down_speed: int, up_speed: int, retract_steps: int) -> None:
+        self._get("/autotest", threshold=threshold, downSpeed=down_speed, upSpeed=up_speed, retractSteps=retract_steps)
+
     def stop(self) -> None:
         self._get("/stop")
 
@@ -243,6 +334,9 @@ class SensorWorker:
     def send_move(self, direction: str, steps: int, delay_us: int) -> None:
         self._commands.put(("move", (direction, steps, delay_us)))
 
+    def send_autotest(self, threshold: int, down_speed: int, up_speed: int, retract_steps: int) -> None:
+        self._commands.put(("autotest", (threshold, down_speed, up_speed, retract_steps)))
+
     def send_stop(self) -> None:
         self._commands.put(("stop", ()))
 
@@ -268,11 +362,20 @@ class SensorWorker:
         try:
             self.transport.connect()
             self.on_event("connected", self.transport.name)
+            was_in_binary = False
             while not self._stop_event.is_set():
                 self._process_commands()
                 sample = self.transport.read_sample()
+
                 if sample is not None:
                     self.on_event("sample", sample)
+
+                is_in_binary = getattr(self.transport, "in_binary_capture", False)
+                if is_in_binary and not was_in_binary:
+                    self.on_event("capture_started", 0)
+                elif not is_in_binary and was_in_binary:
+                    self.on_event("capture_complete", 0)
+                was_in_binary = is_in_binary
                 if isinstance(self.transport, WifiTransport):
                     self._stop_event.wait(0.18)
         except Exception as exc:
@@ -295,6 +398,9 @@ class SensorWorker:
             elif command == "stop":
                 self.transport.stop()
                 self.on_event("command", "Motor stopped")
+            elif command == "autotest":
+                self.transport.autotest(*args)
+                self.on_event("command", f"Automated Test started (Threshold: {args[0]})")
             elif command == "record":
                 self.transport.set_recording(bool(args[0]))
                 state = "High-rate recording started" if args[0] else "High-rate recording stopped"

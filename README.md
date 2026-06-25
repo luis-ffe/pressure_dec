@@ -4,7 +4,8 @@ Cross-platform desktop control and data-recording app for an ESP32, two FSR sens
 
 ## What it does
 
-- Displays the live graph at about 5 Hz (one point every 200 ms). When recording starts, the app commands the ESP32 to capture at 250 Hz while continuing to plot only every 200 ms.
+- ESP32 firmware acquires both FSR channels at 10 kHz per sensor using the ESP-IDF continuous ADC DMA driver.
+- Automatically captures exactly 0.5 seconds when either FSR crosses the configured threshold, then dumps one fixed-size raw binary block over USB.
 - Sends motor direction, number of steps, pulse delay, and stop commands.
 - Labels each recording with a test type/name.
 - Exports recorded measurements to CSV or a formatted Excel workbook with a summary chart.
@@ -14,18 +15,29 @@ Cross-platform desktop control and data-recording app for an ESP32, two FSR sens
 
 Open `firmware/esp32_sensor_tester/esp32_sensor_tester.ino` in Arduino IDE and upload it.
 
-The timer calls use the ESP32 Arduino Core 3.x API, matching the original firmware. Select the correct ESP32 board and a 115200 baud upload speed. If **Move up** physically moves down, swap `UP_DIRECTION_LEVEL` and `DOWN_DIRECTION_LEVEL` near the top of the sketch.
+The timer and ADC calls use the ESP32 Arduino Core 3.x API. The current sketch was compile-checked against Arduino-ESP32 3.3.8 for the classic **ESP32 Dev Module**. If **Move up** physically moves down, swap `UP_DIRECTION_LEVEL` and `DOWN_DIRECTION_LEVEL` near the top of the sketch.
 
-The firmware uses 115200 baud and accepts these USB serial commands, one per line:
+The firmware uses **460,800 baud** and accepts these USB serial commands, one per line. The installed USB-UART bridge was tested at 2,000,000 baud but dropped bytes, so the lower verified rate is used to protect measurement fidelity:
 
 ```
 PING
 MOVE,UP,200,500
 MOVE,DOWN,200,500
 STOP
+RECORD,1
 ```
 
-It streams only `S,time_ms,fsr1,fsr2`. The idle rate is approximately 5 Hz; `RECORD,1` switches acquisition to 250 Hz (approximately 4 ms between sample pairs), and `RECORD,0` returns to idle. Acquisition runs in a dedicated FreeRTOS task; the existing motor hardware-timer interrupt remains independent. The HTTP endpoints (`/sensors`, `/move`, and `/stop`) remain available over Wi-Fi.
+The DMA conversion pattern alternates ADC1 channel 4 (GPIO32) and ADC1 channel 5 (GPIO33) at 20,000 total conversions per second. This produces 10,000 complete FSR pairs per second. A 64-pair circular buffer retains 6.4 ms of pre-trigger history. When either FSR reaches `FSR_TRIGGER_THRESHOLD`, the firmware fills a 5,000-pair capture and queues it from a dedicated USB task. `RECORD,1` is retained as an optional manual software trigger.
+
+Every capture is exactly **20,000 bytes**, with no header, timestamps, ASCII values, or delimiters. Values are unsigned 16-bit little-endian integers interleaved as:
+
+```text
+fsr1[0], fsr2[0], fsr1[1], fsr2[1], ... fsr1[4999], fsr2[4999]
+```
+
+No ESP32-to-computer acknowledgements are printed, because text bytes would corrupt the fixed-length binary stream. Motor commands are still accepted over USB, and the existing HTTP endpoints (`/sensors`, `/move`, and `/stop`) remain available over Wi-Fi. DMA acquisition and USB dumping run in dedicated FreeRTOS tasks; the motor hardware-timer ISR remains independent.
+
+The Python desktop app opens USB at 460,800 baud and reads each fixed 20,000-byte block without waiting on long blocking reads. It decodes 5,000 sample pairs at 100 µs spacing, automatically stops the UI recording when the complete block arrives, and also accepts autonomous pressure-triggered captures. The live plot still draws only approximately every 200 ms while CSV/Excel retain all 5,000 samples.
 
 ## 2. Run from Python
 
@@ -70,7 +82,7 @@ PyInstaller does not cross-compile: build the `.app` on macOS and the `.exe` on 
 
 Every recorded and exported row contains only `time_ms`, `fsr1`, and `fsr2`. Time starts at zero for each recording. The live graph only retains its last 30 seconds, but recording retains every high-rate sample until **Clear** is used, so CSV and Excel exports contain the full recording. Raw FSR readings are ADC counts (0–4095); force units require calibration for the particular sensor and mechanical setup.
 
-Sensor data and control commands use separate message formats. The high-rate USB sensor stream remains the compact `S,time_ms,fsr1,fsr2` format, and the Wi-Fi `/sensors` response contains the same three values as JSON. Motor and recording control remain explicit commands such as `MOVE,UP,200,500`, `STOP`, and `RECORD,1`, so shortening measurement rows does not remove any motor-control information.
+The raw binary block is converted to the three-column CSV/Excel format by the Python app. Since the firmware intentionally sends no timestamps, the app reconstructs `time_ms` from the fixed 100 µs sample spacing.
 
 When recording stops, the app estimates response delay from the first point at which each sensor crosses 10% of its own recorded range. This is an onset estimate; noise, preload, saturation, and different sensor sensitivities can affect it.
 

@@ -9,7 +9,7 @@ from typing import Iterable
 
 @dataclass(frozen=True)
 class Measurement:
-    time_ms: int
+    time_ms: float
     fsr1: int
     fsr2: int
 
@@ -29,7 +29,8 @@ class ResponseDelay:
         if magnitude < 0.5:
             return "Response delay: both sensors responded together"
         leader = "FSR 1" if self.signed_delay_ms > 0 else "FSR 2"
-        return f"Response delay: {leader} leads by {magnitude:.0f} ms"
+        precision = f"{magnitude:.1f}" if magnitude < 10 else f"{magnitude:.0f}"
+        return f"Response delay: {leader} leads by {precision} ms"
 
 
 def calculate_response_delay(measurements: Iterable[Measurement]) -> ResponseDelay | None:
@@ -84,7 +85,7 @@ def export_xlsx(path: str | Path, measurements: Iterable[Measurement]) -> None:
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     for row in sheet.iter_rows(min_row=2, min_col=1, max_col=1):
-        row[0].number_format = "0"
+        row[0].number_format = "0.000"
 
     summary = workbook.create_sheet("Summary")
     summary["A1"] = "ESP32 Sensor Test Summary"
