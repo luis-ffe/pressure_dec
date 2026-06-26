@@ -36,6 +36,7 @@ constexpr uint32_t USB_BAUD = 460800;
 constexpr size_t USB_TX_BUFFER_BYTES = 1024;
 constexpr size_t STREAM_BUFFER_BYTES = 16384;
 constexpr size_t USB_DUMP_CHUNK_BYTES = 512;
+constexpr uint32_t USB_PREVIEW_PERIOD_MS = 200;
 
 // adc_continuous sample_freq_hz is the TOTAL conversion rate across the pattern.
 // Two alternating channels at 20 kconversions/s therefore produce 10,000
@@ -315,6 +316,23 @@ void processSerialCommand(String line) {
     isRecording = false;
     return;
   }
+  if (line.startsWith("F,") || line.startsWith("B,")) {
+    int firstComma = line.indexOf(',');
+    int secondComma = line.indexOf(',', firstComma + 1);
+    if (firstComma < 0 || secondComma < 0) {
+      return;
+    }
+    long steps = line.substring(firstComma + 1, secondComma).toInt();
+    int delayUs = line.substring(secondComma + 1).toInt();
+    if (steps < 1 || delayUs < 20 || delayUs > 5000) {
+      return;
+    }
+    // Closed-loop profile commands:
+    //   F = press forward/increase pressure, same physical direction as AUTOTEST down
+    //   B = back off/decrease pressure
+    startMove(line[0] == 'B', steps, delayUs);
+    return;
+  }
   if (line.startsWith("MOVE,")) {
     int firstComma = line.indexOf(',');
     int secondComma = line.indexOf(',', firstComma + 1);
@@ -486,7 +504,7 @@ void loop() {
   }
 
   static uint32_t lastLiveTx = 0;
-  if (!isRecording && millis() - lastLiveTx >= 30) {
+  if (!isRecording && millis() - lastLiveTx >= USB_PREVIEW_PERIOD_MS) {
     lastLiveTx = millis();
     Serial.printf("S,%lu,%u,%u\n", (unsigned long)millis(), latestFsr1, latestFsr2);
   }
