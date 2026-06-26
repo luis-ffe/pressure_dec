@@ -26,7 +26,6 @@ public slots:
     virtual void disconnectFromDevice() = 0;
     virtual void move(const QString& direction, int steps, int delayUs) = 0;
     virtual void stop() = 0;
-    virtual void autoTest(int threshold, int downSpeed, int upSpeed, int retractSteps) = 0;
     virtual void startCapture() = 0;
     virtual void stopCapture() = 0;
     virtual void pressureNudge(bool increasePressure, int steps, int delayUs) = 0;

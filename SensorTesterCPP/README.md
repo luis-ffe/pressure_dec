@@ -2,9 +2,8 @@
 
 Native C++/Qt version of the ESP32 Sensor Tester UI.
 
-This folder is intentionally separate from the existing Python app. All source,
-build scripts, and generated build files for this version live inside
-`SensorTesterCPP/`.
+All C++ app source, build scripts, and generated build files for this version
+live inside `SensorTesterCPP/`.
 
 ## Features
 
@@ -34,7 +33,6 @@ build scripts, and generated build files for this version live inside
 src/
   core/
     AppConstants.h       Shared protocol/timing constants
-    CaptureDecoder.*     Fixed-size binary DMA capture decoder
     ClosedLoopController.* Target-vs-actual command generator
     DataExporter.*       CSV and Excel-openable XML export
     DelayAnalyzer.*      Sensor response-delay calculation
@@ -43,10 +41,12 @@ src/
     Measurement.h        Data structs shared across the app
   transport/
     Transport.h          Abstract transport interface
+    TransportFactory.*   Factory for USB/Wi-Fi transport creation
     SerialTransport.*    USB serial implementation
     WifiTransport.*      Wi-Fi HTTP implementation
     SerialPortEnumerator.* Port discovery
   ui/
+    AppStyle.*           Centralized Qt styling
     MainWindow.*         Application controller and UI composition
     LivePlotWidget.*     Custom fixed-window graph widget
     ProfileCurveWidget.* 10-second target profile preview
@@ -57,9 +57,10 @@ examples/
 
 The main design split is the `Transport` interface. The UI talks to one
 transport abstraction and does not need to know whether commands are going over
-USB serial or Wi-Fi HTTP. USB capture decoding, delay calculation, and export
-are separate services so they can be tested or replaced without rewriting the
-main window.
+USB serial or Wi-Fi HTTP. Transport creation is isolated in `TransportFactory`.
+Closed-loop profile math, delay calculation, export, plotting widgets, and app
+styling are separate modules so they can be tested or replaced without
+rewriting the main window.
 
 Live preview and recorded acquisition are intentionally separate. The graph is
 always throttled to the selected low-rate interval between 100 ms and 500 ms.

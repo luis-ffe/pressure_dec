@@ -26,7 +26,6 @@ public slots:
     void disconnectFromDevice() override;
     void move(const QString& direction, int steps, int delayUs) override;
     void stop() override;
-    void autoTest(int threshold, int downSpeed, int upSpeed, int retractSteps) override;
     void startCapture() override;
     void stopCapture() override;
     void pressureNudge(bool increasePressure, int steps, int delayUs) override;

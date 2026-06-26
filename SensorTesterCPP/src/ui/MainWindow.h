@@ -44,7 +44,6 @@ private slots:
 
 private:
     void buildUi();
-    void applyStyle();
     void setConnectedUi(bool connected, const QString& label = "Disconnected");
     void createTransport();
     void attachTransportSignals();
@@ -58,7 +57,7 @@ private:
     void beginCapture();
     void finishCapture(const QVector<Measurement>& samples);
     void addDisplayedSample(const SensorSample& sample);
-    void addDisplayedMeasurement(double graphBaseSeconds, int index, const Measurement& row);
+    void addDisplayedMeasurement(double graphBaseSeconds, const Measurement& row);
     QString defaultExportBaseName() const;
     QLabel* createReadingCard(const QString& title);
     void updateMotorSummary();

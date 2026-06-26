@@ -20,8 +20,6 @@ qt_add_executable(SensorTesterCPP
     MACOSX_BUNDLE
     src/main.cpp
     src/core/AppConstants.h
-    src/core/CaptureDecoder.cpp
-    src/core/CaptureDecoder.h
     src/core/ClosedLoopController.cpp
     src/core/ClosedLoopController.h
     src/core/DataExporter.cpp
@@ -37,8 +35,12 @@ qt_add_executable(SensorTesterCPP
     src/transport/SerialTransport.cpp
     src/transport/SerialTransport.h
     src/transport/Transport.h
+    src/transport/TransportFactory.cpp
+    src/transport/TransportFactory.h
     src/transport/WifiTransport.cpp
     src/transport/WifiTransport.h
+    src/ui/AppStyle.cpp
+    src/ui/AppStyle.h
     src/ui/GraphPreviewWidget.cpp
     src/ui/GraphPreviewWidget.h
     src/ui/LivePlotWidget.cpp
@@ -59,6 +61,12 @@ target_link_libraries(SensorTesterCPP
         Qt6::SerialPort
         Qt6::Network
 )
+
+if(MSVC)
+    target_compile_options(SensorTesterCPP PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(SensorTesterCPP PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 set_target_properties(SensorTesterCPP PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.local.SensorTesterCPP"

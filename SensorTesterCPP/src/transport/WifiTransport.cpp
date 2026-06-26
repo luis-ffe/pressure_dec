@@ -60,16 +60,6 @@ void WifiTransport::stop() {
     emit statusMessage("Motor stopped");
 }
 
-void WifiTransport::autoTest(int threshold, int downSpeed, int upSpeed, int retractSteps) {
-    get("/autotest", {
-                         {"threshold", QString::number(threshold)},
-                         {"downSpeed", QString::number(downSpeed)},
-                         {"upSpeed", QString::number(upSpeed)},
-                         {"retractSteps", QString::number(retractSteps)},
-                     });
-    emit statusMessage(QString("Automated Test: moving down until %1").arg(threshold));
-}
-
 void WifiTransport::startCapture() {
     emit errorOccurred("The 10 kHz DMA capture is available only through USB.");
 }

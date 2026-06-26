@@ -69,11 +69,6 @@ void SerialTransport::stop() {
     emit statusMessage("Motor stopped");
 }
 
-void SerialTransport::autoTest(int threshold, int downSpeed, int upSpeed, int retractSteps) {
-    writeCommand(QString("AUTOTEST,%1,%2,%3,%4").arg(threshold).arg(downSpeed).arg(upSpeed).arg(retractSteps));
-    emit statusMessage(QString("Automated Test: moving down until %1").arg(threshold));
-}
-
 void SerialTransport::startCapture() {
     rxBuffer_.clear();
     binaryBuffer_.clear();

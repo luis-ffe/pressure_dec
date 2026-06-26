@@ -1,13 +1,11 @@
 #include "MainWindow.h"
 
 #include <QtCore/QDateTime>
-#include <QtWidgets/QApplication>
 #include <QtWidgets/QDialog>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QGroupBox>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QMessageBox>
-#include <QtWidgets/QStyleFactory>
 #include <QtWidgets/QVBoxLayout>
 
 #include <algorithm>
@@ -17,7 +15,7 @@
 #include "../core/DataExporter.h"
 #include "../core/DelayAnalyzer.h"
 #include "../transport/SerialPortEnumerator.h"
-#include "../transport/SerialTransport.h"
+#include "../transport/TransportFactory.h"
 #include "../transport/WifiTransport.h"
 #include "MotorControlDialog.h"
 #include "RecordingSetupDialog.h"
@@ -37,7 +35,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     connect(&closedLoopTimer_, &QTimer::timeout, this, &MainWindow::runClosedLoopStep);
     buildUi();
-    applyStyle();
     applyRecordingSettings();
     updateMotorSummary();
     updateRecordingSummary();
@@ -205,49 +202,6 @@ void MainWindow::buildUi() {
     connect(exportExcelButton_, &QPushButton::clicked, this, &MainWindow::exportExcel);
 }
 
-void MainWindow::applyStyle() {
-    QApplication::setStyle(QStyleFactory::create("Fusion"));
-    setStyleSheet(R"(
-        QMainWindow, QWidget { background: #f5f7fb; color: #111827; }
-        QGroupBox {
-            background: white;
-            border: 1px solid #dfe4ea;
-            border-radius: 10px;
-            margin-top: 12px;
-            padding: 10px;
-            font-weight: 600;
-        }
-        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
-        QPushButton {
-            background: #eef2ff;
-            border: 1px solid #c7d2fe;
-            border-radius: 7px;
-            padding: 7px 10px;
-        }
-        QPushButton:hover { background: #e0e7ff; }
-        QPushButton#dangerButton {
-            background: #fee2e2;
-            border-color: #fca5a5;
-            font-weight: 700;
-            padding: 10px;
-        }
-        QLabel#subtitle { color: #6b7280; }
-        QLabel#statusPill {
-            background: #f3f4f6;
-            border: 1px solid #e5e7eb;
-            border-radius: 9px;
-            padding: 4px 8px;
-            color: #374151;
-        }
-        QLabel[reading="true"] {
-            background: white;
-            border: 1px solid #dfe4ea;
-            border-radius: 12px;
-            padding: 16px;
-        }
-    )");
-}
-
 QLabel* MainWindow::createReadingCard(const QString& title) {
     auto* box = new QGroupBox(title);
     auto* layout = new QVBoxLayout(box);
@@ -327,14 +281,24 @@ void MainWindow::createTransport() {
             QMessageBox::warning(this, "No serial port", "Connect the ESP32, then click Refresh ports.");
             return;
         }
-        transport_ = std::make_unique<SerialTransport>(portCombo_->currentData().toString());
+        transport_ = TransportFactory::create({
+            Transport::Kind::Usb,
+            portCombo_->currentData().toString(),
+            {},
+            recordingSettings_.displayIntervalMs,
+        });
     } else {
         const QString url = wifiEdit_->text().trimmed();
         if (url.isEmpty()) {
             QMessageBox::warning(this, "No Wi‑Fi address", "Enter the ESP32 address, normally http://192.168.4.1");
             return;
         }
-        transport_ = std::make_unique<WifiTransport>(url, recordingSettings_.displayIntervalMs);
+        transport_ = TransportFactory::create({
+            Transport::Kind::Wifi,
+            {},
+            url,
+            recordingSettings_.displayIntervalMs,
+        });
     }
 }
 
@@ -590,7 +554,7 @@ void MainWindow::finishCapture(const QVector<Measurement>& samples) {
             measurements_.push_back(samples[index]);
         }
         if (replayGraphFromFinishedCapture && (index % recordingSettings_.displayStrideForUsbCapture() == 0 || index == samples.size() - 1)) {
-            addDisplayedMeasurement(graphBase, index, samples[index]);
+            addDisplayedMeasurement(graphBase, samples[index]);
         }
     }
 
@@ -675,27 +639,25 @@ void MainWindow::runClosedLoopStep() {
     }
 
     const double elapsedSeconds = profileElapsed_.elapsed() / 1000.0;
-    const double target = closedLoopController_.targetPressureAt(elapsedSeconds);
-    const auto command = closedLoopController_.commandFor(elapsedSeconds, latestActualPressure_);
-    if (!command.has_value()) {
+    const PressureControlDecision decision = closedLoopController_.decide(elapsedSeconds, latestActualPressure_);
+    if (!decision.shouldMove()) {
         motionLabel_->setText(QString("Curve target %1 ADC · actual %2 ADC · hold")
-                                  .arg(QString::number(target, 'f', 0))
-                                  .arg(QString::number(latestActualPressure_, 'f', 0)));
+                                  .arg(QString::number(decision.targetPressure, 'f', 0))
+                                  .arg(QString::number(decision.actualPressure, 'f', 0)));
         return;
     }
 
-    const bool increasePressure = target > latestActualPressure_;
     transport_->pressureNudge(
-        increasePressure,
-        recordingSettings_.testProfile.commandSteps,
-        recordingSettings_.testProfile.commandDelayUs);
+        decision.increasesPressure(),
+        decision.commandSteps,
+        decision.commandDelayUs);
     motionLabel_->setText(QString("Curve target %1 ADC · actual %2 ADC · %3")
-                              .arg(QString::number(target, 'f', 0))
-                              .arg(QString::number(latestActualPressure_, 'f', 0))
-                              .arg(increasePressure ? "press" : "retract"));
+                              .arg(QString::number(decision.targetPressure, 'f', 0))
+                              .arg(QString::number(decision.actualPressure, 'f', 0))
+                              .arg(decision.increasesPressure() ? "press" : "retract"));
 }
 
-void MainWindow::addDisplayedMeasurement(double graphBaseSeconds, int index, const Measurement& row) {
+void MainWindow::addDisplayedMeasurement(double graphBaseSeconds, const Measurement& row) {
     addDisplayedSample({
         graphBaseSeconds + row.timeMs / 1000.0,
         row.fsr1,
