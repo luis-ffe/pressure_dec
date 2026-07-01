@@ -62,10 +62,30 @@ target_link_libraries(SensorTesterCPP
         Qt6::Network
 )
 
+qt_add_executable(FsrLiveViewer
+    MACOSX_BUNDLE
+    src/viewer/main_fsr_viewer.cpp
+    src/viewer/FsrViewerWindow.cpp
+    src/viewer/FsrViewerWindow.h
+    src/viewer/FsrPlotWidget.cpp
+    src/viewer/FsrPlotWidget.h
+    src/core/AppConstants.h
+    src/ui/AppStyle.cpp
+    src/ui/AppStyle.h
+)
+
+target_link_libraries(FsrLiveViewer
+    PRIVATE
+        Qt6::Widgets
+        Qt6::SerialPort
+)
+
 if(MSVC)
     target_compile_options(SensorTesterCPP PRIVATE /W4 /permissive-)
+    target_compile_options(FsrLiveViewer PRIVATE /W4 /permissive-)
 else()
     target_compile_options(SensorTesterCPP PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(FsrLiveViewer PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 set_target_properties(SensorTesterCPP PROPERTIES
@@ -75,7 +95,19 @@ set_target_properties(SensorTesterCPP PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
 
+set_target_properties(FsrLiveViewer PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.local.FsrLiveViewer"
+    MACOSX_BUNDLE_BUNDLE_NAME "FsrLiveViewer"
+    MACOSX_BUNDLE_DISPLAY_NAME "FsrLiveViewer"
+    WIN32_EXECUTABLE TRUE
+)
+
 install(TARGETS SensorTesterCPP
+    BUNDLE DESTINATION .
+    RUNTIME DESTINATION .
+)
+
+install(TARGETS FsrLiveViewer
     BUNDLE DESTINATION .
     RUNTIME DESTINATION .
 )

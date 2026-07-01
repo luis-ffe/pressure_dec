@@ -18,7 +18,7 @@ struct TestProfileSettings {
     double controlIntervalMs = 20.0;
     double controlDeadband = 10.0;
     int commandSteps = 10;
-    int commandDelayUs = 80;
+    int commandDelayUs = 62;
 
     [[nodiscard]] double amplitude() const;
     [[nodiscard]] double offset() const;

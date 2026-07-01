@@ -7,3 +7,4 @@ cmake --build build --config Release
 
 echo
 echo "Built: $(pwd)/build/bin/SensorTesterCPP.app"
+echo "Built: $(pwd)/build/bin/FsrLiveViewer.app"

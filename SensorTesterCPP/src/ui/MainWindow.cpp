@@ -59,7 +59,7 @@ void MainWindow::buildUi() {
     titleFont.setPointSize(22);
     titleFont.setBold(true);
     title->setFont(titleFont);
-    auto* subtitle = new QLabel("10 kHz DMA capture · motor control · export");
+    auto* subtitle = new QLabel("ADS1256 USB capture · motor control · export");
     subtitle->setObjectName("subtitle");
     titleRow->addWidget(title);
     titleRow->addStretch();
@@ -174,8 +174,8 @@ void MainWindow::buildUi() {
 
     auto* readingsRow = new QHBoxLayout();
     readingsRow->setSpacing(12);
-    fsr1Value_ = createReadingCard("FSR 1 · GPIO 32");
-    fsr2Value_ = createReadingCard("FSR 2 · GPIO 33");
+    fsr1Value_ = createReadingCard("FSR 1 · ADS1256 AIN1");
+    fsr2Value_ = createReadingCard("FSR 2 · ADS1256 AIN2");
     readingsRow->addWidget(fsr1Value_->parentWidget());
     readingsRow->addWidget(fsr2Value_->parentWidget());
     rightLayout->addLayout(readingsRow);
@@ -446,7 +446,7 @@ void MainWindow::toggleRecording() {
         }
         startRecordingSession(
             transport_->kind() == Transport::Kind::Usb
-                ? "Recording armed — waiting for 10 kHz DMA capture…"
+                ? "Recording armed — waiting for ADS1256 USB stream…"
                 : "Recording low-rate Wi‑Fi samples…");
         if (transport_->kind() == Transport::Kind::Usb) {
             transport_->startCapture();
@@ -536,7 +536,7 @@ void MainWindow::beginCapture() {
     recordingStartSampleSeconds_ = latestGraphTimeSeconds_;
     lastDisplayedSampleSeconds_ = recordingStartSampleSeconds_ - (recordingSettings_.displayIntervalMs / 1000.0);
     updateRunButtonLabels();
-    recordLabel_->setText("Receiving 10 kHz DMA capture…");
+    recordLabel_->setText("Receiving ADS1256 USB stream…");
     delayLabel_->setText("Response delay: capturing…");
 }
 

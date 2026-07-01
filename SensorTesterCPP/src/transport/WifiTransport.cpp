@@ -13,7 +13,9 @@
 namespace sensor {
 
 WifiTransport::WifiTransport(QString baseUrl, int pollIntervalMs, QObject* parent)
-    : Transport(parent), baseUrl_(std::move(baseUrl)), pollIntervalMs_(std::clamp(pollIntervalMs, 100, 500)) {
+    : Transport(parent),
+      baseUrl_(std::move(baseUrl)),
+      pollIntervalMs_(std::clamp(pollIntervalMs, constants::MinWifiPollMs, constants::MaxDisplayIntervalMs)) {
     baseUrl_ = baseUrl_.trimmed();
     while (baseUrl_.endsWith('/')) {
         baseUrl_.chop(1);
@@ -31,7 +33,7 @@ bool WifiTransport::isConnected() const {
 }
 
 void WifiTransport::setPollIntervalMs(int pollIntervalMs) {
-    pollIntervalMs_ = std::clamp(pollIntervalMs, 100, 500);
+    pollIntervalMs_ = std::clamp(pollIntervalMs, constants::MinWifiPollMs, constants::MaxDisplayIntervalMs);
     pollTimer_.setInterval(pollIntervalMs_);
 }
 
@@ -61,7 +63,7 @@ void WifiTransport::stop() {
 }
 
 void WifiTransport::startCapture() {
-    emit errorOccurred("The 10 kHz DMA capture is available only through USB.");
+    emit errorOccurred("The high-rate ADS1256 capture is available only through USB.");
 }
 
 void WifiTransport::stopCapture() {

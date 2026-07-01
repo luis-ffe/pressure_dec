@@ -21,8 +21,8 @@ struct RecordingSettings {
     int maxPressure = constants::AdcMaxValue;
     bool loopEnabled = false;
     int timeLimitSeconds = 0;       // 0 means no limit.
-    double acquisitionIntervalMs = 0.1;  // 0.1 ms = 100 microseconds.
-    int displayIntervalMs = 200;    // UI graph is intentionally low-rate.
+    double acquisitionIntervalMs = constants::SampleIntervalMs;
+    int displayIntervalMs = constants::DefaultDisplayIntervalMs;    // UI graph throttle.
     TestProfileSettings testProfile;
 
     [[nodiscard]] int acquisitionStrideForUsbCapture() const {

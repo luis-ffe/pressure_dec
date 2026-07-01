@@ -33,6 +33,7 @@ private:
     void writeCommand(const QString& command);
     void processAsciiBuffer();
     void processCaptureBuffer();
+    void handleStatusLine(const QByteArray& line);
     void decodePreviewLine(const QByteArray& line);
     void appendBinaryMeasurements(const QByteArray& payload, bool keepRemainder);
     void beginCapture();

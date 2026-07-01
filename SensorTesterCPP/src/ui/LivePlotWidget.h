@@ -31,7 +31,7 @@ private:
     QPoint mapPoint(const QRect& plotRect, double startSeconds, double seconds, quint16 value) const;
 
     QVector<PlotPoint> points_;
-    int maxValue_ = 4095;
+    int maxValue_ = constants::AdcMaxValue;
     GraphMode graphMode_ = GraphMode::DualLines;
 };
 

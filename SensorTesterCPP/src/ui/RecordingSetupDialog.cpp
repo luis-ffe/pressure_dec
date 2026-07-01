@@ -74,7 +74,7 @@ RecordingSetupDialog::RecordingSetupDialog(RecordingSettings settings, QWidget* 
     resize(820, 760);
 
     auto* layout = new QVBoxLayout(this);
-    auto* intro = new QLabel("Choose how recorded data is saved and how the low-rate UI graph is displayed.");
+    auto* intro = new QLabel("Choose how recorded data is saved and how often the live UI graph is refreshed.");
     intro->setWordWrap(true);
     layout->addWidget(intro);
 
@@ -184,15 +184,15 @@ RecordingSetupDialog::RecordingSetupDialog(RecordingSettings settings, QWidget* 
     maxPressureSpin_->setSuffix(" ADC");
 
     acquisitionIntervalSpin_ = new QDoubleSpinBox();
-    acquisitionIntervalSpin_->setRange(0.1, 500.0);
-    acquisitionIntervalSpin_->setSingleStep(0.1);
+    acquisitionIntervalSpin_->setRange(constants::SampleIntervalMs, 500.0);
+    acquisitionIntervalSpin_->setSingleStep(1.0);
     acquisitionIntervalSpin_->setDecimals(1);
     acquisitionIntervalSpin_->setValue(settings.acquisitionIntervalMs);
     acquisitionIntervalSpin_->setSuffix(" ms");
 
     displayIntervalSpin_ = new QSpinBox();
-    displayIntervalSpin_->setRange(100, 500);
-    displayIntervalSpin_->setSingleStep(50);
+    displayIntervalSpin_->setRange(constants::MinDisplayIntervalMs, constants::MaxDisplayIntervalMs);
+    displayIntervalSpin_->setSingleStep(1);
     displayIntervalSpin_->setValue(settings.displayIntervalMs);
     displayIntervalSpin_->setSuffix(" ms");
 
@@ -223,8 +223,9 @@ RecordingSetupDialog::RecordingSetupDialog(RecordingSettings settings, QWidget* 
     updateProfilePreview();
 
     auto* note = new QLabel(
-        "Note: USB still receives the ESP32 DMA block at 100 µs internally. If you choose a slower saved interval, "
-        "the app downsamples before storing/exporting. Wi‑Fi acquisition is limited to the low-rate display interval.");
+        "Note: USB receives the ADS1256 stream at 2 ms per AIN1/AIN2 pair. If you choose a slower saved interval, "
+        "the app downsamples before storing/exporting. The live graph can refresh from 1 ms to 500 ms. "
+        "Wi‑Fi polling remains protected at 100 ms minimum even if the graph interval is lower.");
     note->setWordWrap(true);
     note->setObjectName("subtitle");
     layout->addWidget(note);

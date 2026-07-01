@@ -1,5 +1,6 @@
 #include "SerialTransport.h"
 
+#include <QtCore/QThread>
 #include <QtCore/QtEndian>
 #include <QtSerialPort/QSerialPortInfo>
 
@@ -36,6 +37,13 @@ void SerialTransport::connectToDevice() {
         return;
     }
 
+    // Several ESP32 USB-UART boards wire DTR/RTS to BOOT/EN. Keep both released
+    // during normal app use so opening the serial port does not hold the board
+    // in reset or flashing mode.
+    serial_.setDataTerminalReady(false);
+    serial_.setRequestToSend(false);
+    QThread::msleep(1500);
+
     rxBuffer_.clear();
     binaryBuffer_.clear();
     captureSamples_.clear();
@@ -60,13 +68,14 @@ void SerialTransport::disconnectFromDevice() {
 }
 
 void SerialTransport::move(const QString& direction, int steps, int delayUs) {
-    writeCommand(QString("MOVE,%1,%2,%3").arg(direction.toUpper()).arg(steps).arg(delayUs));
-    emit statusMessage(QString("Commanded %1: %2 steps").arg(direction).arg(steps));
+    const QString normalizedDirection = direction.toUpper();
+    writeCommand(QString("MOVE,%1,%2,%3").arg(normalizedDirection).arg(steps).arg(delayUs));
+    emit statusMessage(QString("Sent MOVE,%1,%2,%3").arg(normalizedDirection).arg(steps).arg(delayUs));
 }
 
 void SerialTransport::stop() {
     writeCommand("STOP");
-    emit statusMessage("Motor stopped");
+    emit statusMessage("Sent STOP");
 }
 
 void SerialTransport::startCapture() {
@@ -97,7 +106,10 @@ void SerialTransport::onReadyRead() {
 }
 
 void SerialTransport::onSerialError(QSerialPort::SerialPortError error) {
-    if (error != QSerialPort::NoError && serial_.isOpen()) {
+    if (error == QSerialPort::NoError || error == QSerialPort::TimeoutError) {
+        return;
+    }
+    if (serial_.isOpen()) {
         emit errorOccurred("USB error: " + serial_.errorString());
     }
 }
@@ -129,8 +141,17 @@ void SerialTransport::processAsciiBuffer() {
             }
             return;
         }
+        if (line.startsWith("PONG") || line.startsWith("OK,") || line.startsWith("ERR,") ||
+            line.startsWith("BOOT,") || line.startsWith("WARN,")) {
+            handleStatusLine(line);
+            continue;
+        }
         decodePreviewLine(line);
     }
+}
+
+void SerialTransport::handleStatusLine(const QByteArray& line) {
+    emit statusMessage("USB " + QString::fromLatin1(line));
 }
 
 void SerialTransport::processCaptureBuffer() {
@@ -205,7 +226,7 @@ void SerialTransport::appendBinaryMeasurements(const QByteArray& payload, bool k
         const double timeMs = capturePairIndex_ * constants::SampleIntervalMs;
         captureSamples_.push_back({timeMs, fsr1, fsr2});
 
-        if (capturePairIndex_ % 128 == 0) {
+        if (capturePairIndex_ % constants::MinCapturePreviewStride == 0) {
             emit sampleReceived({
                 timeMs / 1000.0,
                 fsr1,

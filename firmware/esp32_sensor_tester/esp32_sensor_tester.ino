@@ -1,69 +1,83 @@
 #include <Arduino.h>
+#include "FastAccelStepper.h"
+#include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_timer.h>
 #include <esp_attr.h>
-#include <esp_adc/adc_continuous.h>
-#include <hal/adc_types.h>
-#include <soc/soc_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
 
 #if !CONFIG_IDF_TARGET_ESP32
-#error "This sketch targets the classic ESP32: GPIO32/33, ADC1 channels 4/5."
+#error "This sketch targets the classic ESP32 pinout used by the actuator controller."
 #endif
 
 // ESP32 creates this access point for the optional Wi-Fi connection.
 const char* WIFI_SSID = "ESP32_Actuator_Control";
 const char* WIFI_PASSWORD = "password123";
 
-// Existing motor wiring. Motor pulse generation remains hardware-timer driven.
+// Existing motor wiring. FastAccelStepper generates the pulse train.
 const int ENA_PIN = 15;
 const int DIR_PIN = 2;
 const int PUL_PIN = 16;
 
-// FSR1 = GPIO32 = ADC1 channel 4. FSR2 = GPIO33 = ADC1 channel 5.
-const int FSR1_PIN = 32;
-const int FSR2_PIN = 33;
-constexpr adc_channel_t FSR1_CHANNEL = ADC_CHANNEL_4;
-constexpr adc_channel_t FSR2_CHANNEL = ADC_CHANNEL_5;
+// ADS1256 external ADC wiring.
+// FSR1 = ADS1256 AIN1, FSR2 = ADS1256 AIN2, both read single-ended vs AINCOM/GND.
+constexpr int ADS_CS_PIN = 5;
+constexpr int ADS_DRDY_PIN = 27;
+constexpr int ADS_SCK_PIN = 18;
+constexpr int ADS_MOSI_PIN = 23;
+constexpr int ADS_MISO_PIN = 19;
 
-// This board's USB-UART bridge lost bytes at 2 Mbaud and also failed flashing at
-// 921600. Use 460800 for verified, lossless transport; ADC acquisition remains
-// 10 kHz/channel.
-constexpr uint32_t USB_BAUD = 460800;
+// Use a conservative baud while validating the C++ app <-> ESP32 command path.
+// The ADS1256 stream is about 2 KB/s at 500 pairs/s, so 115200 is sufficient.
+constexpr uint32_t USB_BAUD = 115200;
 constexpr size_t USB_TX_BUFFER_BYTES = 1024;
 constexpr size_t STREAM_BUFFER_BYTES = 16384;
 constexpr size_t USB_DUMP_CHUNK_BYTES = 512;
 constexpr uint32_t USB_PREVIEW_PERIOD_MS = 200;
 
-// adc_continuous sample_freq_hz is the TOTAL conversion rate across the pattern.
-// Two alternating channels at 20 kconversions/s therefore produce 10,000
-// sample pairs/s: one new 12-bit value per sensor every 100 microseconds.
-constexpr uint32_t SAMPLE_PAIRS_PER_SECOND = 10000;
-// To prevent ADC crosstalk (ghosting) between high-impedance FSR channels,
-// we oversample by scheduling 8 consecutive conversions per channel and keeping
-// only the final stabilized reading.
-constexpr uint32_t OVERSAMPLE_COUNT = 8;
-constexpr uint32_t ADC_CONVERSIONS_PER_SECOND = SAMPLE_PAIRS_PER_SECOND * OVERSAMPLE_COUNT * 2;
+constexpr uint32_t SAMPLE_PAIRS_PER_SECOND = 500;
+constexpr uint32_t SAMPLE_PAIR_PERIOD_US = 1000000UL / SAMPLE_PAIRS_PER_SECOND;
+constexpr uint32_t ADS_SPI_CLOCK_HZ = 1000000;
+constexpr uint32_t ADS_DRDY_TIMEOUT_US = 50000;
 
-// The classic ESP32 DMA result is 2 bytes. A 256-byte conversion frame arrives
-// every ~6.4 ms at 20 kconversions/s. The 8 KB driver pool gives the acquisition
-// task ample scheduling margin without delaying motor or Wi-Fi work.
-constexpr size_t DMA_CONVERSION_FRAME_BYTES = 256;
-constexpr size_t DMA_DRIVER_POOL_BYTES = 8192;
-constexpr size_t DMA_READ_BUFFER_BYTES = 1024;
+constexpr uint8_t ADS_CMD_WAKEUP = 0x00;
+constexpr uint8_t ADS_CMD_RDATA = 0x01;
+constexpr uint8_t ADS_CMD_SDATAC = 0x0F;
+constexpr uint8_t ADS_CMD_RREG = 0x10;
+constexpr uint8_t ADS_CMD_WREG = 0x50;
+constexpr uint8_t ADS_CMD_SELFCAL = 0xF0;
+constexpr uint8_t ADS_CMD_SYNC = 0xFC;
+
+constexpr uint8_t ADS_REG_STATUS = 0x00;
+constexpr uint8_t ADS_REG_MUX = 0x01;
+constexpr uint8_t ADS_REG_ADCON = 0x02;
+constexpr uint8_t ADS_REG_DRATE = 0x03;
+
+constexpr uint8_t ADS_MUX_AINCOM = 0x08;
+// ADS1256 sensor mapping.
+constexpr uint8_t ADS_FSR1_CHANNEL = 1;  // FSR1 signal on AIN1.
+constexpr uint8_t ADS_FSR2_CHANNEL = 2;  // FSR2 signal on AIN2.
+constexpr uint8_t ADS_SINGLE_ENDED_NEGATIVE = ADS_MUX_AINCOM;
+constexpr uint8_t ADS_DRATE_1000SPS = 0xA1;
+constexpr uint8_t ADS_ADCON_CLOCK_OUT_OFF = 0x00;
+constexpr uint8_t ADS_ADCON_SENSOR_DETECT_OFF = 0x00;
+constexpr uint8_t ADS_ADCON_PGA_MASK = 0x07;
+constexpr uint8_t ADS_ADCON_PGA_GAIN_1 = 0x00;
+constexpr uint8_t ADS_ADCON_FORCE_GAIN_1 =
+    ADS_ADCON_CLOCK_OUT_OFF | ADS_ADCON_SENSOR_DETECT_OFF | ADS_ADCON_PGA_GAIN_1;
+constexpr uint32_t ADS_ENGINEERING_MAX = 5000;
+const SPISettings ADS_SPI_SETTINGS(ADS_SPI_CLOCK_HZ, MSBFIRST, SPI_MODE1);
 
 // Swap these two levels if the physical actuator moves opposite to the UI.
 const int UP_DIRECTION_LEVEL = HIGH;
 const int DOWN_DIRECTION_LEVEL = LOW;
 
-volatile long stepsRemaining = 0;
-volatile bool isMoving = false;
-volatile int pulseDelayUs = 1000;
-hw_timer_t* timer = nullptr;
 WebServer server(80);
+FastAccelStepperEngine stepperEngine = FastAccelStepperEngine();
+FastAccelStepper* stepper = nullptr;
 
 String serialLine;
 
@@ -75,10 +89,6 @@ struct FsrSamplePair {
   uint16_t fsr2;
 };
 static_assert(sizeof(FsrSamplePair) == 4, "FSR pair must be exactly four bytes");
-static_assert(sizeof(adc_digi_output_data_t) == SOC_ADC_DIGI_RESULT_BYTES,
-              "Unexpected ADC DMA result size");
-
-DRAM_ATTR uint8_t dmaReadBuffer[DMA_READ_BUFFER_BYTES] __attribute__((aligned(4)));
 
 volatile bool isRecording = false;
 volatile bool isAutoTesting = false;
@@ -89,53 +99,68 @@ long autoTestReturnSteps = 1000;
 int autoTestReturnSpeed = 500;
 volatile uint16_t latestFsr1 = 0;
 volatile uint16_t latestFsr2 = 0;
+volatile int32_t latestAdsRaw = 0;
 volatile uint32_t latestSampleTimeUs = 0;
 volatile uint32_t adcReadErrors = 0;
+volatile bool adsReady = false;
+volatile uint8_t latestAdsAdcon = 0xFF;
+volatile uint32_t adsPgaCorrections = 0;
 
-adc_continuous_handle_t adcHandle = nullptr;
 TaskHandle_t adcTaskHandle = nullptr;
 TaskHandle_t usbDumpTaskHandle = nullptr;
 StreamBufferHandle_t binaryStream = nullptr;
+bool stepperReady = false;
+volatile int pulseDelayUs = 1000;
 
-void IRAM_ATTR onTimer() {
-  static bool pulseState = false;
-  if (isMoving && stepsRemaining > 0) {
-    pulseState = !pulseState;
-    digitalWrite(PUL_PIN, pulseState);
-    if (!pulseState) {
-      stepsRemaining--;
-      if (stepsRemaining <= 0) {
-        isMoving = false;
-      }
-    }
-  } else if (pulseState) {
-    pulseState = false;
-    digitalWrite(PUL_PIN, LOW);
+bool motorIsRunning() {
+  return stepperReady && stepper && stepper->isRunning();
+}
+
+uint8_t adsPgaGainFromAdcon(uint8_t adcon) {
+  switch (adcon & ADS_ADCON_PGA_MASK) {
+    case 0x00: return 1;
+    case 0x01: return 2;
+    case 0x02: return 4;
+    case 0x03: return 8;
+    case 0x04: return 16;
+    case 0x05: return 32;
+    case 0x06: return 64;
+    default: return 0;
   }
 }
 
+long motorStepsRemaining() {
+  if (!stepperReady || !stepper) {
+    return 0;
+  }
+  return labs(stepper->targetPos() - stepper->getCurrentPosition());
+}
+
+uint32_t speedHzFromPulseDelay(int delayUs) {
+  const uint32_t safeDelayUs = constrain(delayUs, 20, 5000);
+  // The desktop app's "pulse delay" value is the historical delay between
+  // steps from the original bit-banged motor code. FastAccelStepper wants
+  // steps/second, so preserve that UI meaning as 1 step every delayUs.
+  return max(1UL, 1000000UL / safeDelayUs);
+}
+
 void startMove(bool up, long steps, int requestedDelayUs) {
-  if (steps < 1) return;
+  if (steps < 1 || !stepperReady || !stepper) return;
   pulseDelayUs = constrain(requestedDelayUs, 20, 5000);
-  timerAlarm(timer, pulseDelayUs, true, 0);
-  timerStart(timer);
-  timerRestart(timer);
-  digitalWrite(DIR_PIN, up ? UP_DIRECTION_LEVEL : DOWN_DIRECTION_LEVEL);
-  digitalWrite(ENA_PIN, LOW);
-  delayMicroseconds(10);
-  stepsRemaining = steps;
-  isMoving = true;
+  stepper->setSpeedInHz(speedHzFromPulseDelay(pulseDelayUs));
+  stepper->setCurrentPosition(0);
+  stepper->move(up ? steps : -steps);
 }
 
 void stopMove() {
-  stepsRemaining = 0;
-  isMoving = false;
-  digitalWrite(PUL_PIN, LOW);
-  digitalWrite(ENA_PIN, HIGH);
+  if (stepperReady && stepper) {
+    stepper->forceStop();
+    stepper->disableOutputs();
+  }
 }
 
 String sensorJson() {
-  // HTTP returns only the latest cached DMA pair; it never touches the ADC.
+  // HTTP returns only the latest cached ADS1256 pair; it never blocks on SPI.
   uint16_t fsr1 = latestFsr1;
   uint16_t fsr2 = latestFsr2;
   uint32_t timeUs = latestSampleTimeUs;
@@ -143,77 +168,268 @@ String sensorJson() {
   String json = "{\"time_ms\":" + String((uint32_t)(timeUs / 1000));
   json += ",\"fsr1\":" + String(fsr1);
   json += ",\"fsr2\":" + String(fsr2);
+  json += ",\"ads_ready\":" + String(adsReady ? "true" : "false");
+  json += ",\"stepper_ready\":" + String(stepperReady ? "true" : "false");
+  json += ",\"moving\":" + String(motorIsRunning() ? "true" : "false");
+  json += ",\"steps_remaining\":" + String(motorStepsRemaining());
+  json += ",\"adc_errors\":" + String(adcReadErrors);
+  json += ",\"ads_adcon\":" + String(latestAdsAdcon);
+  json += ",\"ads_pga_gain\":" + String(adsPgaGainFromAdcon(latestAdsAdcon));
+  json += ",\"ads_pga_corrections\":" + String(adsPgaCorrections);
   json += "}";
   return json;
 }
 
-void adcDmaTask(void* parameter) {
-  uint16_t bestFsr1 = 0;
-  uint16_t bestFsr2 = 0;
-  uint8_t last_channel = 255;
+void adsSelect() {
+  SPI.beginTransaction(ADS_SPI_SETTINGS);
+  digitalWrite(ADS_CS_PIN, LOW);
+}
+
+void adsDeselect() {
+  digitalWrite(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
+void adsCommand(uint8_t command) {
+  adsSelect();
+  SPI.transfer(command);
+  adsDeselect();
+  delayMicroseconds(4);
+}
+
+void adsWriteRegister(uint8_t reg, uint8_t value) {
+  adsSelect();
+  SPI.transfer(ADS_CMD_WREG | reg);
+  SPI.transfer(0x00);  // Write one register.
+  SPI.transfer(value);
+  adsDeselect();
+  delayMicroseconds(4);
+}
+
+uint8_t adsReadRegister(uint8_t reg) {
+  adsSelect();
+  SPI.transfer(ADS_CMD_RREG | reg);
+  SPI.transfer(0x00);  // Read one register.
+  delayMicroseconds(10);
+  const uint8_t value = SPI.transfer(0xFF);
+  adsDeselect();
+  delayMicroseconds(4);
+  return value;
+}
+
+bool adsForcePgaGain1() {
+  adsWriteRegister(ADS_REG_ADCON, ADS_ADCON_FORCE_GAIN_1);
+  const uint8_t adcon = adsReadRegister(ADS_REG_ADCON);
+  latestAdsAdcon = adcon;
+  const bool isGain1 = (adcon & ADS_ADCON_PGA_MASK) == ADS_ADCON_PGA_GAIN_1;
+  if (!isGain1) {
+    adcReadErrors++;
+  }
+  return isGain1;
+}
+
+void adsEnsurePgaGain1() {
+  const uint8_t adcon = adsReadRegister(ADS_REG_ADCON);
+  latestAdsAdcon = adcon;
+  if ((adcon & ADS_ADCON_PGA_MASK) != ADS_ADCON_PGA_GAIN_1) {
+    adsPgaCorrections++;
+    adsForcePgaGain1();
+  }
+}
+
+bool adsWaitForDrdy(uint32_t timeoutUs = ADS_DRDY_TIMEOUT_US) {
+  const uint32_t start = micros();
+  while (digitalRead(ADS_DRDY_PIN) == HIGH) {
+    if ((uint32_t)(micros() - start) >= timeoutUs) {
+      adcReadErrors++;
+      return false;
+    }
+    if ((uint32_t)(micros() - start) > 1000) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      delayMicroseconds(10);
+    }
+  }
+  return true;
+}
+
+bool adsWaitForDrdyCycle(uint32_t timeoutUs = ADS_DRDY_TIMEOUT_US) {
+  const uint32_t start = micros();
+  while (digitalRead(ADS_DRDY_PIN) == LOW) {
+    if ((uint32_t)(micros() - start) >= timeoutUs) {
+      adcReadErrors++;
+      return false;
+    }
+    if ((uint32_t)(micros() - start) > 1000) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      delayMicroseconds(5);
+    }
+  }
+  return adsWaitForDrdy(timeoutUs);
+}
+
+int32_t adsReadDataRaw() {
+  adsSelect();
+  SPI.transfer(ADS_CMD_RDATA);
+  delayMicroseconds(10);
+  const uint8_t b0 = SPI.transfer(0xFF);
+  const uint8_t b1 = SPI.transfer(0xFF);
+  const uint8_t b2 = SPI.transfer(0xFF);
+  adsDeselect();
+
+  int32_t value = ((int32_t)b0 << 16) | ((int32_t)b1 << 8) | b2;
+  if (value & 0x800000) {
+    value |= 0xFF000000;
+  }
+  return value;
+}
+
+bool adsSetMux(uint8_t positiveChannel, uint8_t negativeChannel) {
+  adsWriteRegister(ADS_REG_MUX, (positiveChannel << 4) | negativeChannel);
+  adsCommand(ADS_CMD_SYNC);
+  adsCommand(ADS_CMD_WAKEUP);
+  return adsWaitForDrdyCycle();
+}
+
+int32_t adsReadFixedChannelRaw() {
+  if (!adsWaitForDrdy()) {
+    return 0;
+  }
+  return adsReadDataRaw();
+}
+
+int32_t adsReadSingleEndedRaw(uint8_t positiveChannel) {
+  if (!adsSetMux(positiveChannel, ADS_SINGLE_ENDED_NEGATIVE)) {
+    return 0;
+  }
+  (void)adsReadDataRaw();  // Discard first conversion after mux switch.
+
+  if (!adsWaitForDrdyCycle()) {
+    return 0;
+  }
+  return adsReadDataRaw();
+}
+
+uint16_t adsRawToUint16(int32_t raw) {
+  if (raw <= 0) {
+    return 0;
+  }
+  if (raw > 0x7FFFFF) {
+    raw = 0x7FFFFF;
+  }
+  return static_cast<uint16_t>(
+      (static_cast<uint64_t>(raw) * static_cast<uint64_t>(ADS_ENGINEERING_MAX)) / 0x7FFFFFULL);
+}
+
+uint16_t median5(uint16_t a, uint16_t b, uint16_t c, uint16_t d, uint16_t e) {
+  uint16_t values[5] = {a, b, c, d, e};
+  for (uint8_t i = 1; i < 5; ++i) {
+    const uint16_t key = values[i];
+    int8_t j = i - 1;
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      --j;
+    }
+    values[j + 1] = key;
+  }
+  return values[2];
+}
+
+uint16_t medianFilteredValue(uint16_t rawValue, uint16_t history[5], uint8_t& index, bool& filled) {
+  history[index] = rawValue;
+  index = (index + 1) % 5;
+  if (index == 0) {
+    filled = true;
+  }
+  if (!filled) {
+    return rawValue;
+  }
+  return median5(history[0], history[1], history[2], history[3], history[4]);
+}
+
+void handleAutoTestThreshold(uint16_t fsr1, uint16_t fsr2) {
+  static uint16_t consecutiveOverThreshold = 0;
+  if (!isAutoTesting) {
+    consecutiveOverThreshold = 0;
+    return;
+  }
+
+  if (fsr1 >= autoTestThreshold || fsr2 >= autoTestThreshold) {
+    consecutiveOverThreshold++;
+    if (consecutiveOverThreshold > 10) {  // ~10 ms at 1 k sample-pairs/s.
+      if (stepperReady && stepper) {
+        autoTestReturnSteps = labs(stepper->getCurrentPosition());
+        stepper->forceStop();
+      } else {
+        autoTestReturnSteps = autoTestTotalSteps;
+      }
+      autoTestTriggered = true;
+      isAutoTesting = false;
+      consecutiveOverThreshold = 0;
+    }
+  } else {
+    consecutiveOverThreshold = 0;
+  }
+}
+
+void adsAcquisitionTask(void* parameter) {
+  uint32_t nextPairTimeUs = micros();
+  uint16_t fsr1History[5] = {};
+  uint16_t fsr2History[5] = {};
+  uint8_t fsr1HistoryIndex = 0;
+  uint8_t fsr2HistoryIndex = 0;
+  bool fsr1HistoryFilled = false;
+  bool fsr2HistoryFilled = false;
 
   while (true) {
-    uint32_t bytesRead = 0;
-    esp_err_t result = adc_continuous_read(
-        adcHandle,
-        dmaReadBuffer,
-        sizeof(dmaReadBuffer),
-        &bytesRead,
-        100);
-
-    if (result == ESP_ERR_TIMEOUT) {
-      continue;
-    }
-    if (result != ESP_OK) {
-      adcReadErrors++;
-      taskYIELD();
-      continue;
-    }
-
-    for (uint32_t offset = 0;
-         offset + SOC_ADC_DIGI_RESULT_BYTES <= bytesRead;
-         offset += SOC_ADC_DIGI_RESULT_BYTES) {
-      const adc_digi_output_data_t* sample =
-          reinterpret_cast<const adc_digi_output_data_t*>(dmaReadBuffer + offset);
-      const uint16_t raw = sample->type1.data;
-      const uint8_t channel = sample->type1.channel;
-
-      if (channel == FSR1_CHANNEL) {
-        if (last_channel == FSR2_CHANNEL) {
-          // Channel just switched from FSR2 to FSR1. A full pattern cycle completed.
-          // Emit the pair using the final, fully-stabilized reading of each channel.
-          const FsrSamplePair pair = {bestFsr1, bestFsr2};
-          
-          latestFsr1 = pair.fsr1;
-          latestFsr2 = pair.fsr2;
-          latestSampleTimeUs = (uint32_t)esp_timer_get_time();
-
-          if (isRecording) {
-            xStreamBufferSend(binaryStream, &pair, sizeof(pair), 0);
-          }
-        }
-        bestFsr1 = raw;
-        last_channel = channel;
-      } else if (channel == FSR2_CHANNEL) {
-        bestFsr2 = raw;
-        last_channel = channel;
-        if (isAutoTesting) {
-          static uint16_t consecutiveOverThreshold = 0;
-          if (bestFsr1 >= autoTestThreshold || bestFsr2 >= autoTestThreshold) {
-            consecutiveOverThreshold++;
-            if (consecutiveOverThreshold > 100) { // Require ~10ms of sustained force to trigger
-              autoTestReturnSteps = autoTestTotalSteps - stepsRemaining;
-              autoTestTriggered = true;
-              isAutoTesting = false;
-              stepsRemaining = 0; // stop immediately via ISR
-              consecutiveOverThreshold = 0;
-            }
-          } else {
-            consecutiveOverThreshold = 0;
-          }
-        }
+    if (!adsReady) {
+      adsReady = setupAds1256();
+      if (!adsReady) {
+        latestSampleTimeUs = (uint32_t)esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        nextPairTimeUs = micros();
+        continue;
       }
     }
+
+    static uint16_t pgaVerifyCounter = 0;
+    if (++pgaVerifyCounter >= 250) {
+      pgaVerifyCounter = 0;
+      adsEnsurePgaGain1();
+    }
+
+    const int32_t fsr1AdsRaw = adsReadSingleEndedRaw(ADS_FSR1_CHANNEL);
+    const int32_t fsr2AdsRaw = adsReadSingleEndedRaw(ADS_FSR2_CHANNEL);
+    latestAdsRaw = fsr1AdsRaw;
+    const uint16_t fsr1Raw = adsRawToUint16(fsr1AdsRaw);
+    const uint16_t fsr2Raw = adsRawToUint16(fsr2AdsRaw);
+    const uint16_t fsr1 = medianFilteredValue(fsr1Raw, fsr1History, fsr1HistoryIndex, fsr1HistoryFilled);
+    const uint16_t fsr2 = medianFilteredValue(fsr2Raw, fsr2History, fsr2HistoryIndex, fsr2HistoryFilled);
+    const FsrSamplePair pair = {fsr1, fsr2};
+
+    latestFsr1 = pair.fsr1;
+    latestFsr2 = pair.fsr2;
+    latestSampleTimeUs = (uint32_t)esp_timer_get_time();
+
+    handleAutoTestThreshold(pair.fsr1, pair.fsr2);
+
+    if (isRecording) {
+      xStreamBufferSend(binaryStream, &pair, sizeof(pair), 0);
+    }
+
+    nextPairTimeUs += SAMPLE_PAIR_PERIOD_US;
+    const int32_t waitUs = (int32_t)(nextPairTimeUs - micros());
+    if (waitUs > 1000) {
+      vTaskDelay(pdMS_TO_TICKS(waitUs / 1000));
+    } else if (waitUs > 0) {
+      delayMicroseconds(waitUs);
+    } else {
+      nextPairTimeUs = micros();
+      taskYIELD();
+    }
+    // Always give the Arduino loop time to process USB motor commands.
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -224,7 +440,7 @@ void usbDumpTask(void* parameter) {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
     
-    // Tell the Python host that a continuous binary stream will follow
+    // Tell the desktop host that a continuous binary stream will follow.
     Serial.print("BINARY_CAPTURE_START\n");
     Serial.flush();
     
@@ -239,7 +455,7 @@ void usbDumpTask(void* parameter) {
       }
     }
     
-    // We stopped recording. Give the DMA task a moment to notice `isRecording == false`
+    // We stopped recording. Give the acquisition task a moment to notice `isRecording == false`.
     vTaskDelay(pdMS_TO_TICKS(5));
     
     // Drain whatever was left in the stream buffer
@@ -256,56 +472,69 @@ void usbDumpTask(void* parameter) {
   }
 }
 
-bool setupContinuousAdc() {
-  adc_continuous_handle_cfg_t handleConfig = {};
-  handleConfig.max_store_buf_size = DMA_DRIVER_POOL_BYTES;
-  handleConfig.conv_frame_size = DMA_CONVERSION_FRAME_BYTES;
-  handleConfig.flags.flush_pool = 0;
+bool setupAds1256() {
+  pinMode(ADS_CS_PIN, OUTPUT);
+  digitalWrite(ADS_CS_PIN, HIGH);
+  pinMode(ADS_DRDY_PIN, INPUT);
 
-  if (adc_continuous_new_handle(&handleConfig, &adcHandle) != ESP_OK) {
-    return false;
-  }
+  SPI.begin(ADS_SCK_PIN, ADS_MISO_PIN, ADS_MOSI_PIN, ADS_CS_PIN);
+  delay(100);
 
-  adc_digi_pattern_config_t patterns[OVERSAMPLE_COUNT * 2] = {};
-  for (uint32_t i = 0; i < OVERSAMPLE_COUNT; i++) {
-    patterns[i].atten = ADC_ATTEN_DB_12;
-    patterns[i].channel = FSR1_CHANNEL;
-    patterns[i].unit = ADC_UNIT_1;
-    patterns[i].bit_width = ADC_BITWIDTH_12;
-  }
-  for (uint32_t i = OVERSAMPLE_COUNT; i < OVERSAMPLE_COUNT * 2; i++) {
-    patterns[i].atten = ADC_ATTEN_DB_12;
-    patterns[i].channel = FSR2_CHANNEL;
-    patterns[i].unit = ADC_UNIT_1;
-    patterns[i].bit_width = ADC_BITWIDTH_12;
-  }
+  adsCommand(ADS_CMD_SDATAC);
+  adsWriteRegister(ADS_REG_STATUS, 0x00);          // MSB first, no input buffer.
+  const bool pgaOk = adsForcePgaGain1();           // Clock out off, sensor detect off, PGA gain = 1.
+  adsWriteRegister(ADS_REG_DRATE, ADS_DRATE_1000SPS);
+  adsCommand(ADS_CMD_SELFCAL);
+  const bool calibrated = adsWaitForDrdy(1000000);
+  const bool muxOk = adsSetMux(ADS_FSR1_CHANNEL, ADS_SINGLE_ENDED_NEGATIVE);
 
-  adc_continuous_config_t adcConfig = {};
-  adcConfig.pattern_num = OVERSAMPLE_COUNT * 2;
-  adcConfig.adc_pattern = patterns;
-  adcConfig.sample_freq_hz = ADC_CONVERSIONS_PER_SECOND;
-  adcConfig.conv_mode = ADC_CONV_SINGLE_UNIT_1;
-  adcConfig.format = ADC_DIGI_OUTPUT_FORMAT_TYPE1;
-
-  if (adc_continuous_config(adcHandle, &adcConfig) != ESP_OK) {
-    adc_continuous_deinit(adcHandle);
-    adcHandle = nullptr;
-    return false;
-  }
-
-  return adc_continuous_start(adcHandle) == ESP_OK;
+  return calibrated && pgaOk && muxOk;
 }
 
 void processSerialCommand(String line) {
   line.trim();
+  const bool canSendAsciiReply = !isRecording;
 
-  // No acknowledgements are transmitted because any ASCII mixed into the
-  // outbound stream would corrupt the continuous raw capture protocol.
   if (line == "PING") {
+    if (canSendAsciiReply) {
+      Serial.print("PONG,ESP32_SENSOR_TESTER_ADS1256,");
+      Serial.print(stepperReady ? "MOTOR_READY" : "MOTOR_NOT_READY");
+      Serial.print(",");
+      Serial.print(adsReady ? "ADS_READY" : "ADS_NOT_READY");
+      Serial.print(",ADCON=0x");
+      if (latestAdsAdcon < 0x10) {
+        Serial.print("0");
+      }
+      Serial.print(latestAdsAdcon, HEX);
+      Serial.print(",PGA=");
+      Serial.print(adsPgaGainFromAdcon(latestAdsAdcon));
+      Serial.print(",MAP=FSR1_AIN");
+      Serial.print(ADS_FSR1_CHANNEL);
+      Serial.print("_FSR2_AIN");
+      Serial.println(ADS_FSR2_CHANNEL);
+    }
+    return;
+  }
+  if (line == "RAW") {
+    if (canSendAsciiReply) {
+      const int32_t raw = latestAdsRaw;
+      const uint32_t raw24 = static_cast<uint32_t>(raw) & 0x00FFFFFFUL;
+      Serial.printf(
+          "RAW,%lu,%ld,0x%06lX,%u,%u,0x%02X\n",
+          (unsigned long)millis(),
+          (long)raw,
+          (unsigned long)raw24,
+          latestFsr1,
+          latestFsr2,
+          latestAdsAdcon);
+    }
     return;
   }
   if (line == "STOP") {
     stopMove();
+    if (canSendAsciiReply) {
+      Serial.println("OK,STOP");
+    }
     return;
   }
   if (line == "RECORD,1") {
@@ -314,6 +543,8 @@ void processSerialCommand(String line) {
   }
   if (line == "RECORD,0") {
     isRecording = false;
+    // Do not print here. The desktop app is still inside the binary capture
+    // parser until it receives BINARY_CAPTURE_STOP from usbDumpTask.
     return;
   }
   if (line.startsWith("F,") || line.startsWith("B,")) {
@@ -325,12 +556,18 @@ void processSerialCommand(String line) {
     long steps = line.substring(firstComma + 1, secondComma).toInt();
     int delayUs = line.substring(secondComma + 1).toInt();
     if (steps < 1 || delayUs < 20 || delayUs > 5000) {
+      if (canSendAsciiReply) {
+        Serial.println("ERR,CLOSED_LOOP_BAD_VALUES");
+      }
       return;
     }
     // Closed-loop profile commands:
     //   F = press forward/increase pressure, same physical direction as AUTOTEST down
     //   B = back off/decrease pressure
     startMove(line[0] == 'B', steps, delayUs);
+    if (canSendAsciiReply) {
+      Serial.printf("OK,%c,%ld,%d\n", line[0], steps, delayUs);
+    }
     return;
   }
   if (line.startsWith("MOVE,")) {
@@ -338,6 +575,9 @@ void processSerialCommand(String line) {
     int secondComma = line.indexOf(',', firstComma + 1);
     int thirdComma = line.indexOf(',', secondComma + 1);
     if (secondComma < 0 || thirdComma < 0) {
+      if (canSendAsciiReply) {
+        Serial.println("ERR,MOVE_PARSE");
+      }
       return;
     }
     String direction = line.substring(firstComma + 1, secondComma);
@@ -345,9 +585,15 @@ void processSerialCommand(String line) {
     int delayUs = line.substring(thirdComma + 1).toInt();
     bool directionValid = direction == "UP" || direction == "DOWN";
     if (!directionValid || steps < 1 || delayUs < 20 || delayUs > 5000) {
+      if (canSendAsciiReply) {
+        Serial.println("ERR,MOVE_BAD_VALUES");
+      }
       return;
     }
     startMove(direction == "UP", steps, delayUs);
+    if (canSendAsciiReply) {
+      Serial.printf("OK,MOVE,%s,%ld,%d\n", direction.c_str(), steps, delayUs);
+    }
     return;
   }
   if (line.startsWith("AUTOTEST,")) {
@@ -365,8 +611,20 @@ void processSerialCommand(String line) {
       isAutoTesting = true;
       autoTestTriggered = false;
       startMove(false, autoTestTotalSteps, downSpeed);
+      if (canSendAsciiReply) {
+        Serial.printf("OK,AUTOTEST,%u,%d,%d,%ld\n",
+                      autoTestThreshold,
+                      downSpeed,
+                      autoTestReturnSpeed,
+                      autoTestTotalSteps);
+      }
     }
     return;
+  }
+
+  if (canSendAsciiReply && line.length() > 0) {
+    Serial.print("ERR,UNKNOWN_COMMAND,");
+    Serial.println(line);
   }
 }
 
@@ -415,7 +673,11 @@ void handleRoot() {
 
 void fatalStartupFailure() {
   stopMove();
+  Serial.println("ERR,FATAL_STARTUP");
+  Serial.flush();
   while (true) {
+    Serial.println("ERR,FATAL_STARTUP");
+    Serial.flush();
     delay(1000);
   }
 }
@@ -425,33 +687,43 @@ void setup() {
   Serial.setTxBufferSize(USB_TX_BUFFER_BYTES);
   Serial.begin(USB_BAUD);
   serialLine.reserve(100);
+  Serial.println("BOOT,ESP32_SENSOR_TESTER_ADS1256");
+  Serial.flush();
 
   pinMode(ENA_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
   pinMode(PUL_PIN, OUTPUT);
-  pinMode(FSR1_PIN, INPUT);
-  pinMode(FSR2_PIN, INPUT);
   digitalWrite(ENA_PIN, HIGH);
   digitalWrite(PUL_PIN, LOW);
   digitalWrite(DIR_PIN, DOWN_DIRECTION_LEVEL);
 
-  // Existing Arduino-ESP32 3.x motor timer: one tick per microsecond.
-  timer = timerBegin(1000000);
-  if (timer == nullptr) {
-    fatalStartupFailure();
+  stepperEngine.init();
+  stepper = stepperEngine.stepperConnectToPin(PUL_PIN);
+  if (stepper) {
+    stepper->setDirectionPin(DIR_PIN, UP_DIRECTION_LEVEL == HIGH);
+    stepper->setEnablePin(ENA_PIN, true);  // ENA low enables the common driver wiring.
+    stepper->setAutoEnable(true);
+    stepper->setDelayToEnable(50);
+    stepper->setDelayToDisable(100);
+    stepper->setSpeedInHz(speedHzFromPulseDelay(pulseDelayUs));
+    // Keep manual button moves responsive. The previous bit-banged pulse code
+    // effectively changed speed immediately; a low acceleration here makes the
+    // actuator feel much slower even when the same 62 µs pulse delay is used.
+    stepper->setAcceleration(200000);
+    stepper->disableOutputs();
+    stepperReady = true;
+    Serial.println("BOOT,FASTACCEL_READY");
+  } else {
+    stepperReady = false;
+    Serial.println("ERR,FASTACCEL_INIT_FAILED");
   }
-  timerAttachInterrupt(timer, &onTimer);
-  timerAlarm(timer, pulseDelayUs, true, 0);
-  timerStart(timer);
 
   binaryStream = xStreamBufferCreate(STREAM_BUFFER_BYTES, 512);
   if (binaryStream == nullptr) {
     fatalStartupFailure();
   }
 
-  // Create consumers before starting DMA so a completed capture can always
-  // notify a valid dump task. Both application tasks stay on core 1, leaving
-  // the ESP32 Wi-Fi system work on core 0 undisturbed.
+  // Create the USB dump consumer before recording can start.
   if (xTaskCreatePinnedToCore(
           usbDumpTask,
           "usb-binary-dump",
@@ -463,18 +735,21 @@ void setup() {
     fatalStartupFailure();
   }
 
-  if (!setupContinuousAdc()) {
-    fatalStartupFailure();
-  }
+  // Do not initialize ADS1256 in setup. If the ADC is disconnected, held in
+  // reset, or wired incorrectly, setup must still reach the motor/USB command
+  // loop. The acquisition task initializes and retries the ADS1256 in the
+  // background.
+  adsReady = false;
+  Serial.println("BOOT,ADS1256_BACKGROUND_INIT");
 
   if (xTaskCreatePinnedToCore(
-          adcDmaTask,
-          "adc-dma-20k",
+          adsAcquisitionTask,
+          "ads1256-acq",
           4096,
           nullptr,
-          3,
+          1,
           &adcTaskHandle,
-          1) != pdPASS) {
+          0) != pdPASS) {
     fatalStartupFailure();
   }
 
@@ -485,21 +760,23 @@ void setup() {
   server.on("/stop", handleStop);
   server.on("/sensors", handleSensors);
   server.begin();
+  Serial.println("BOOT,READY");
+  Serial.flush();
 }
 
 void loop() {
-  // Motor pulses run in the hardware timer ISR. DMA acquisition and USB dump
+  // Motor pulses run inside FastAccelStepper. ADS acquisition and USB dump
   // run in their own tasks, so this loop remains available for Wi-Fi and input.
   server.handleClient();
   readSerialCommands();
 
   if (autoTestTriggered) {
     autoTestTriggered = false;
-    stopMove();
     startMove(true, autoTestReturnSteps, autoTestReturnSpeed);
-  } else if (isAutoTesting && !isMoving) {
+  } else if (isAutoTesting && !motorIsRunning()) {
     // Reached the end of the downward travel without hitting the threshold.
     isAutoTesting = false;
+    autoTestReturnSteps = autoTestTotalSteps;
     startMove(true, autoTestReturnSteps, autoTestReturnSpeed);
   }
 
