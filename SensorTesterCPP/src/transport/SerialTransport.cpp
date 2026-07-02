@@ -95,6 +95,11 @@ void SerialTransport::pressureNudge(bool increasePressure, int steps, int delayU
     writeCommand(QString("%1,%2,%3").arg(increasePressure ? "F" : "B").arg(steps).arg(delayUs));
 }
 
+void SerialTransport::setFsr2ResistanceChannel(int channel) {
+    writeCommand(QString("FSR2_RES,%1").arg(channel));
+    emit statusMessage(QString("Set FSR2 resistance mux channel C%1").arg(channel));
+}
+
 void SerialTransport::onReadyRead() {
     if (captureActive_) {
         binaryBuffer_.append(serial_.readAll());

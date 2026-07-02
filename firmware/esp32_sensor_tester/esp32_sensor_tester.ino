@@ -30,6 +30,16 @@ constexpr int ADS_SCK_PIN = 18;
 constexpr int ADS_MOSI_PIN = 23;
 constexpr int ADS_MISO_PIN = 19;
 
+// FSR2 resistor-selection analog mux control.
+// Channel order:
+// C0 330R, C1 1k, C2 2.2k, C3 4.7k, C4 10k, C5 20k, C6 47k, C7 68k,
+// C8 100k, C9 220k, C10 300k, C11 470k, C12 680k, C13 1M, C14 4.7M, C15 5.6M.
+constexpr int FSR2_MUX_S0_PIN = 14;
+constexpr int FSR2_MUX_S1_PIN = 26;
+constexpr int FSR2_MUX_S2_PIN = 25;
+constexpr int FSR2_MUX_S3_PIN = 33;
+constexpr uint8_t FSR2_DEFAULT_RESISTANCE_CHANNEL = 4;  // C4 = 10 kΩ.
+
 // Use a conservative baud while validating the C++ app <-> ESP32 command path.
 // The ADS1256 stream is about 2 KB/s at 500 pairs/s, so 115200 is sufficient.
 constexpr uint32_t USB_BAUD = 115200;
@@ -105,6 +115,7 @@ volatile uint32_t adcReadErrors = 0;
 volatile bool adsReady = false;
 volatile uint8_t latestAdsAdcon = 0xFF;
 volatile uint32_t adsPgaCorrections = 0;
+volatile uint8_t fsr2ResistanceChannel = FSR2_DEFAULT_RESISTANCE_CHANNEL;
 
 TaskHandle_t adcTaskHandle = nullptr;
 TaskHandle_t usbDumpTaskHandle = nullptr;
@@ -159,6 +170,26 @@ void stopMove() {
   }
 }
 
+bool setFsr2ResistanceChannel(uint8_t channel) {
+  if (channel > 15) {
+    return false;
+  }
+  fsr2ResistanceChannel = channel;
+  digitalWrite(FSR2_MUX_S0_PIN, (channel & 0x01) ? HIGH : LOW);
+  digitalWrite(FSR2_MUX_S1_PIN, (channel & 0x02) ? HIGH : LOW);
+  digitalWrite(FSR2_MUX_S2_PIN, (channel & 0x04) ? HIGH : LOW);
+  digitalWrite(FSR2_MUX_S3_PIN, (channel & 0x08) ? HIGH : LOW);
+  return true;
+}
+
+void setupFsr2ResistanceMux() {
+  pinMode(FSR2_MUX_S0_PIN, OUTPUT);
+  pinMode(FSR2_MUX_S1_PIN, OUTPUT);
+  pinMode(FSR2_MUX_S2_PIN, OUTPUT);
+  pinMode(FSR2_MUX_S3_PIN, OUTPUT);
+  setFsr2ResistanceChannel(FSR2_DEFAULT_RESISTANCE_CHANNEL);
+}
+
 String sensorJson() {
   // HTTP returns only the latest cached ADS1256 pair; it never blocks on SPI.
   uint16_t fsr1 = latestFsr1;
@@ -176,6 +207,7 @@ String sensorJson() {
   json += ",\"ads_adcon\":" + String(latestAdsAdcon);
   json += ",\"ads_pga_gain\":" + String(adsPgaGainFromAdcon(latestAdsAdcon));
   json += ",\"ads_pga_corrections\":" + String(adsPgaCorrections);
+  json += ",\"fsr2_resistance_channel\":" + String(fsr2ResistanceChannel);
   json += "}";
   return json;
 }
@@ -511,7 +543,22 @@ void processSerialCommand(String line) {
       Serial.print(",MAP=FSR1_AIN");
       Serial.print(ADS_FSR1_CHANNEL);
       Serial.print("_FSR2_AIN");
-      Serial.println(ADS_FSR2_CHANNEL);
+      Serial.print(ADS_FSR2_CHANNEL);
+      Serial.print(",FSR2_RES=C");
+      Serial.println(fsr2ResistanceChannel);
+    }
+    return;
+  }
+  if (line.startsWith("FSR2_RES,")) {
+    const int channel = line.substring(line.indexOf(',') + 1).toInt();
+    if (channel < 0 || channel > 15 || !setFsr2ResistanceChannel(static_cast<uint8_t>(channel))) {
+      if (canSendAsciiReply) {
+        Serial.println("ERR,FSR2_RES_BAD_CHANNEL");
+      }
+      return;
+    }
+    if (canSendAsciiReply) {
+      Serial.printf("OK,FSR2_RES,C%u\n", fsr2ResistanceChannel);
     }
     return;
   }
@@ -667,6 +714,19 @@ void handleSensors() {
   server.send(200, "application/json", sensorJson());
 }
 
+void handleFsr2Resistance() {
+  if (!server.hasArg("channel")) {
+    server.send(400, "text/plain", "Missing channel");
+    return;
+  }
+  const int channel = server.arg("channel").toInt();
+  if (channel < 0 || channel > 15 || !setFsr2ResistanceChannel(static_cast<uint8_t>(channel))) {
+    server.send(400, "text/plain", "Invalid channel");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"channel\":" + String(fsr2ResistanceChannel) + "}");
+}
+
 void handleRoot() {
   server.send(200, "text/plain", "ESP32 Sensor Tester is ready");
 }
@@ -696,6 +756,8 @@ void setup() {
   digitalWrite(ENA_PIN, HIGH);
   digitalWrite(PUL_PIN, LOW);
   digitalWrite(DIR_PIN, DOWN_DIRECTION_LEVEL);
+  setupFsr2ResistanceMux();
+  Serial.printf("BOOT,FSR2_RES,C%u\n", fsr2ResistanceChannel);
 
   stepperEngine.init();
   stepper = stepperEngine.stepperConnectToPin(PUL_PIN);
@@ -759,6 +821,7 @@ void setup() {
   server.on("/move", handleMove);
   server.on("/stop", handleStop);
   server.on("/sensors", handleSensors);
+  server.on("/fsr2_res", handleFsr2Resistance);
   server.begin();
   Serial.println("BOOT,READY");
   Serial.flush();

@@ -29,6 +29,7 @@ public slots:
     virtual void startCapture() = 0;
     virtual void stopCapture() = 0;
     virtual void pressureNudge(bool increasePressure, int steps, int delayUs) = 0;
+    virtual void setFsr2ResistanceChannel(int channel) = 0;
 
 signals:
     void connected(QString displayName);

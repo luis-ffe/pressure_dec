@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <QtCore/QDateTime>
+#include <QtCore/QStringList>
 #include <QtWidgets/QDialog>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QGroupBox>
@@ -24,6 +25,25 @@ namespace sensor {
 
 namespace {
 constexpr int RetractAfterStopSteps = 200;
+
+const QStringList Fsr2ResistanceLabels = {
+    "C0 · 330 Ω",
+    "C1 · 1 kΩ",
+    "C2 · 2.2 kΩ",
+    "C3 · 4.7 kΩ",
+    "C4 · 10 kΩ",
+    "C5 · 20 kΩ",
+    "C6 · 47 kΩ",
+    "C7 · 68 kΩ",
+    "C8 · 100 kΩ",
+    "C9 · 220 kΩ",
+    "C10 · 300 kΩ",
+    "C11 · 470 kΩ",
+    "C12 · 680 kΩ",
+    "C13 · 1 MΩ",
+    "C14 · 4.7 MΩ",
+    "C15 · 5.6 MΩ",
+};
 }
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -133,6 +153,16 @@ void MainWindow::buildUi() {
     emergencyStopButton_ = new QPushButton("EMERGENCY STOP");
     emergencyStopButton_->setObjectName("dangerButton");
     testLayout->addWidget(emergencyStopButton_);
+
+    fsr2ResistanceCombo_ = new QComboBox();
+    for (int channel = 0; channel < Fsr2ResistanceLabels.size(); ++channel) {
+        fsr2ResistanceCombo_->addItem(Fsr2ResistanceLabels[channel], channel);
+    }
+    fsr2ResistanceCombo_->setCurrentIndex(fsr2ResistanceChannel_);
+    fsr2ResistanceCombo_->setToolTip("Selects the analog mux channel that chooses FSR2's resistor");
+    testLayout->addWidget(new QLabel("FSR2 resistor"));
+    testLayout->addWidget(fsr2ResistanceCombo_);
+
     testLayout->addWidget(motionLabel_);
     controlsLayout->addWidget(testBox);
 
@@ -194,6 +224,7 @@ void MainWindow::buildUi() {
     connect(quickMoveUpButton_, &QPushButton::clicked, this, &MainWindow::moveUp);
     connect(quickMoveDownButton_, &QPushButton::clicked, this, &MainWindow::moveDown);
     connect(emergencyStopButton_, &QPushButton::clicked, this, &MainWindow::stopMotor);
+    connect(fsr2ResistanceCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, &MainWindow::setFsr2Resistance);
     connect(autoTestButton_, &QPushButton::clicked, this, &MainWindow::startAutoTest);
     connect(recordButton_, &QPushButton::clicked, this, &MainWindow::toggleRecording);
     connect(recordingSetupButton_, &QPushButton::clicked, this, &MainWindow::openRecordingSetup);
@@ -305,6 +336,7 @@ void MainWindow::createTransport() {
 void MainWindow::attachTransportSignals() {
     connect(transport_.get(), &Transport::connected, this, [this](const QString& label) {
         setConnectedUi(true, "Connected (" + label + ")");
+        setFsr2Resistance();
     });
     connect(transport_.get(), &Transport::disconnected, this, [this] {
         setConnectedUi(false);
@@ -366,6 +398,16 @@ void MainWindow::openMotorControls() {
     });
     connect(dialog, &MotorControlDialog::stopRequested, this, &MainWindow::stopMotor);
     dialog->show();
+}
+
+void MainWindow::setFsr2Resistance() {
+    if (!fsr2ResistanceCombo_) {
+        return;
+    }
+    fsr2ResistanceChannel_ = fsr2ResistanceCombo_->currentData().toInt();
+    if (transport_ && transport_->isConnected()) {
+        transport_->setFsr2ResistanceChannel(fsr2ResistanceChannel_);
+    }
 }
 
 void MainWindow::openRecordingSetup() {

@@ -24,6 +24,7 @@ public slots:
     void startCapture() override;
     void stopCapture() override;
     void pressureNudge(bool increasePressure, int steps, int delayUs) override;
+    void setFsr2ResistanceChannel(int channel) override;
 
 private slots:
     void onReadyRead();

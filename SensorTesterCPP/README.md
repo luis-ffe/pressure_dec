@@ -13,6 +13,9 @@ live inside `SensorTesterCPP/`.
 - Wi-Fi control through the existing ESP32 HTTP endpoints.
 - Motor move up/down, stop, and automated test commands.
 - Motor values and manual motor movement live in a dedicated Motor dialog.
+- FSR2 resistor selection through a 16-channel analog mux, controlled from the
+  main UI. Channels C0–C15 are 330Ω, 1kΩ, 2.2kΩ, 4.7kΩ, 10kΩ, 20kΩ, 47kΩ,
+  68kΩ, 100kΩ, 220kΩ, 300kΩ, 470kΩ, 680kΩ, 1MΩ, 4.7MΩ, and 5.6MΩ.
 - Recording setup dialog for graph mode, max pressure display, loop/time options,
   saved acquisition interval, and UI graph display interval.
 - Manual ADS1256 capture command over USB.
@@ -80,6 +83,10 @@ For USB preview, flash the matching ESP32 firmware from
 and AIN2 with PGA gain 1, sends compact `S,time_ms,fsr1,fsr2` preview lines
 every 200 ms while idle, then switches to marker-delimited binary streaming
 while recording.
+
+FSR2's resistor mux select pins are ESP32 GPIO14, GPIO26, GPIO25, and GPIO33
+for S0, S1, S2, and S3 respectively. The firmware defaults to C4 / 10kΩ at
+boot, and the UI sends `FSR2_RES,<channel>` over USB when the selection changes.
 
 The Recording Setup dialog also contains a Custom Curve / Test Profile section.
 It supports Step Hold, Linear Ramp / Triangle, and Cyclic / Sinusoidal profiles.

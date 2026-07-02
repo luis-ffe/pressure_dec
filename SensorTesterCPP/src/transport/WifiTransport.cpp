@@ -75,6 +75,11 @@ void WifiTransport::pressureNudge(bool increasePressure, int steps, int delayUs)
     get("/move", {{"dir", firmwareDirection}, {"steps", QString::number(steps)}, {"speed", QString::number(delayUs)}});
 }
 
+void WifiTransport::setFsr2ResistanceChannel(int channel) {
+    get("/fsr2_res", {{"channel", QString::number(channel)}});
+    emit statusMessage(QString("Set FSR2 resistance mux channel C%1").arg(channel));
+}
+
 void WifiTransport::requestSensors() {
     if (!connected_) {
         return;

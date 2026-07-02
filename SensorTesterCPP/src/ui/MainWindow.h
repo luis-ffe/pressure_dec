@@ -35,6 +35,7 @@ private slots:
     void moveDown();
     void stopMotor();
     void openMotorControls();
+    void setFsr2Resistance();
     void openRecordingSetup();
     void startAutoTest();
     void toggleRecording();
@@ -78,6 +79,7 @@ private:
     QPushButton* quickMoveUpButton_ = nullptr;
     QPushButton* quickMoveDownButton_ = nullptr;
     QPushButton* emergencyStopButton_ = nullptr;
+    QComboBox* fsr2ResistanceCombo_ = nullptr;
     QPushButton* autoTestButton_ = nullptr;
     QLabel* motionLabel_ = nullptr;
     QPushButton* recordButton_ = nullptr;
@@ -107,6 +109,7 @@ private:
     int currentRecordingStartIndex_ = 0;
     int motorSteps_ = 3200;
     int motorDelayUs_ = 62;
+    int fsr2ResistanceChannel_ = 4;
     double latestGraphTimeSeconds_ = 0.0;
     double recordingStartSampleSeconds_ = 0.0;
     double lastSavedWifiSampleSeconds_ = -1.0;
